@@ -117,14 +117,32 @@ pub(super) fn avc444_encoder_enabled(
         && negotiated_mode == Some(NegotiatedEgfxMode::Avc444)
 }
 
+fn observe_client_connection(
+    client_active: bool,
+    was_client_active: &mut bool,
+    session_start: &mut std::time::Instant,
+) -> bool {
+    let started = client_active && !*was_client_active;
+    *was_client_active = client_active;
+    if started {
+        *session_start = std::time::Instant::now();
+    }
+    started
+}
+
 #[cfg(feature = "vaapi")]
 fn hardware_encoder_enabled(
     config: &crate::config::Config,
     negotiated_mode: Option<NegotiatedEgfxMode>,
+    session_start: std::time::Instant,
+    disabled_session: Option<std::time::Instant>,
 ) -> bool {
     // This backend emits a single AVC420 stream. AVC444 must retain its dual
     // software encoder until a hardware backend implements that wire format.
-    config.hardware_encoding.enabled && negotiated_mode == Some(NegotiatedEgfxMode::Avc420)
+    // A failure suppresses hardware only for the connection that observed it.
+    config.hardware_encoding.enabled
+        && negotiated_mode == Some(NegotiatedEgfxMode::Avc420)
+        && disabled_session != Some(session_start)
 }
 
 /// Client-initiated resize request
@@ -1524,7 +1542,7 @@ impl DisplayChannelHandler {
             let mut egfx_sender: Option<EgfxChannelSender> = None;
             let mut h264_encoder_config: Option<EncoderConfig> = None;
             #[cfg(feature = "vaapi")]
-            let mut hardware_encoding_runtime_disabled = false;
+            let mut hardware_disabled_session = None;
             // IronRDP Planar encoder for EGFX Planar path (used when AVC is disabled and RFX unsupported)
             // AVC444 vs AVC420 determined by VideoEncoder enum variant match, not a flag
 
@@ -1936,8 +1954,12 @@ impl DisplayChannelHandler {
                         let client_now_active = handler
                             .client_active
                             .load(std::sync::atomic::Ordering::Relaxed);
+                        let connection_started = observe_client_connection(
+                            client_now_active,
+                            &mut was_client_active,
+                            &mut session_start,
+                        );
                         if !client_now_active {
-                            was_client_active = false;
                             tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                             continue;
                         }
@@ -1947,19 +1969,13 @@ impl DisplayChannelHandler {
                         // not server start — otherwise after the first 5s of uptime,
                         // every subsequent client bypasses the gate immediately and
                         // gets FastPath bitmaps instead of EGFX.
-                        if !was_client_active {
-                            was_client_active = true;
-                            session_start = std::time::Instant::now();
+                        if connection_started {
                             egfx_gate_bypassed = false;
                             first_frame_received = false;
                             zero_frame_reported = false;
                             frames_sent = 0;
                             frames_dropped = 0;
                             egfx_frames_sent = 0;
-                            #[cfg(feature = "vaapi")]
-                            {
-                                hardware_encoding_runtime_disabled = false;
-                            }
                             video_encoder = None;
                             egfx_sender = None;
                             // Clear cached frame from the earlier session. The cached frame
@@ -2039,9 +2055,11 @@ impl DisplayChannelHandler {
 
                         // Also reset per-connection state from the None arm,
                         // in case PipeWire hasn't delivered a frame yet
-                        if client_waiting && !was_client_active {
-                            was_client_active = true;
-                            session_start = std::time::Instant::now();
+                        if observe_client_connection(
+                            client_waiting,
+                            &mut was_client_active,
+                            &mut session_start,
+                        ) {
                             egfx_gate_bypassed = false;
                             first_frame_received = false;
                             zero_frame_reported = false;
@@ -2370,9 +2388,12 @@ impl DisplayChannelHandler {
                         // Hardware supports the negotiated AVC420 wire format only.
                         #[cfg(feature = "vaapi")]
                         {
-                            if hardware_encoder_enabled(&self.config, negotiated_mode)
-                                && !hardware_encoding_runtime_disabled
-                            {
+                            if hardware_encoder_enabled(
+                                &self.config,
+                                negotiated_mode,
+                                session_start,
+                                hardware_disabled_session,
+                            ) {
                                 let hardware_config = self.config.hardware_encoding.clone();
                                 let hardware_startup = tokio::task::block_in_place(|| {
                                     crate::rdp::channels::graphics::egfx::hardware::HardwareEncoderWorker::start(move || create_hardware_encoder(
@@ -2390,7 +2411,7 @@ impl DisplayChannelHandler {
                                         );
                                     }
                                     Err(e) => {
-                                        hardware_encoding_runtime_disabled = true;
+                                        hardware_disabled_session = Some(session_start);
                                         let recovery = handler
                                             .recover_hardware_encoder(
                                                 h264_encoder_config.clone(),
@@ -2757,7 +2778,7 @@ impl DisplayChannelHandler {
                                 {
                                     #[cfg(feature = "vaapi")]
                                     {
-                                        hardware_encoding_runtime_disabled = true;
+                                        hardware_disabled_session = Some(session_start);
                                     }
                                     if let Some(recovery) = handler
                                         .recover_hardware_encoder(
@@ -2851,7 +2872,7 @@ impl DisplayChannelHandler {
                                 if encoder.is_hardware() {
                                     #[cfg(feature = "vaapi")]
                                     {
-                                        hardware_encoding_runtime_disabled = true;
+                                        hardware_disabled_session = Some(session_start);
                                     }
                                     if let Some(recovery) = handler
                                         .recover_hardware_encoder(
@@ -3613,22 +3634,88 @@ mod tests {
     fn hardware_encoder_matches_only_avc420_negotiation() {
         let mut config = crate::config::Config::default();
         config.hardware_encoding.enabled = true;
+        let session_start = std::time::Instant::now();
         assert!(hardware_encoder_enabled(
             &config,
-            Some(NegotiatedEgfxMode::Avc420)
+            Some(NegotiatedEgfxMode::Avc420),
+            session_start,
+            None,
         ));
         for mode in [
             None,
             Some(NegotiatedEgfxMode::Avc444),
             Some(NegotiatedEgfxMode::Bitmap),
         ] {
-            assert!(!hardware_encoder_enabled(&config, mode));
+            assert!(!hardware_encoder_enabled(
+                &config,
+                mode,
+                session_start,
+                None
+            ));
         }
         config.hardware_encoding.enabled = false;
         assert!(!hardware_encoder_enabled(
             &config,
-            Some(NegotiatedEgfxMode::Avc420)
+            Some(NegotiatedEgfxMode::Avc420),
+            session_start,
+            None,
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "vaapi")]
+    fn hardware_retry_on_reconnect_does_not_require_a_capture_frame() {
+        let mut config = crate::config::Config::default();
+        config.hardware_encoding.enabled = true;
+        let mode = Some(NegotiatedEgfxMode::Avc420);
+        let mut was_client_active = true;
+        let mut session_start = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let session_a = session_start;
+        let factory_calls = std::cell::Cell::new(0u32);
+        let try_hardware = |session_start, disabled_session| {
+            if hardware_encoder_enabled(&config, mode, session_start, disabled_session) {
+                factory_calls.set(factory_calls.get() + 1);
+                true
+            } else {
+                false
+            }
+        };
+
+        assert!(try_hardware(session_start, None));
+        assert_eq!(
+            recover_hardware_failure(
+                true,
+                mode,
+                || Ok::<_, &str>(()),
+                None,
+                &AtomicBool::new(true),
+                "hardware initialization failed",
+            ),
+            Some(()),
+        );
+        let disabled_session = Some(session_a);
+        assert!(!try_hardware(session_start, disabled_session));
+
+        // These polls use the same transition as the no-frame pipeline path.
+        assert!(!observe_client_connection(
+            false,
+            &mut was_client_active,
+            &mut session_start,
+        ));
+        assert_eq!(session_start, session_a);
+        assert!(observe_client_connection(
+            true,
+            &mut was_client_active,
+            &mut session_start,
+        ));
+        assert!(session_start > session_a);
+        assert!(try_hardware(session_start, disabled_session));
+        assert!(!observe_client_connection(
+            true,
+            &mut was_client_active,
+            &mut session_start,
+        ));
+        assert_eq!(factory_calls.get(), 2);
     }
 
     #[test]

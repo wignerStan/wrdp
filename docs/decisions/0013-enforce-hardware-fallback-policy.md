@@ -16,8 +16,14 @@ GraphicsSubsystemFailed through IronRDP's connection disconnect event
 An encoder's supported skip/delay result is not a hardware failure. A failed
 network submission retains its encoder and requests an IDR. Negotiated AVC444
 does not enter this single-stream hardware path. A new connection retries
-hardware after a prior connection used software recovery.
+hardware after a prior connection used software recovery. Hardware failure state
+belongs to the connection's start time, rather than the pipeline's lifetime.
+Both fresh-frame and no-frame polls observe disconnect and reconnect transitions.
+A static desktop therefore permits the next client to retry hardware before a
+new capture frame arrives.
 
 Tests capture disconnect events and count software factory calls for each
 failure, both flag values, negotiated codec mismatches, and a failed software
-constructor.
+constructor. A lifecycle regression covers hardware failure, disconnect, and
+reconnect through the no-frame path. It counts hardware constructor attempts and
+checks that the failed connection remains suppressed.

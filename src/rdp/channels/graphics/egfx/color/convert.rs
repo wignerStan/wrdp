@@ -399,39 +399,27 @@ unsafe fn bgra_to_yuv444_avx2_impl(bgra: &[u8], frame: &mut Yuv444Frame, matrix:
             let v_val = _mm256_max_epi32(v_val, zero);
             let v_val = _mm256_min_epi32(v_val, max_255);
 
-            // Pack 32-bit values to 8-bit and store
-            // Pack 8x i32 -> 8x i16 -> 8x i8
-            //
-            // AVX2 packing crosses 128-bit lanes, which creates a non-contiguous layout:
-            // _mm256_packs_epi32([A0,A1,A2,A3, B0,B1,B2,B3], [C0,C1,C2,C3, D0,D1,D2,D3])
-            //   -> [A0,A1,A2,A3, C0,C1,C2,C3, B0,B1,B2,B3, D0,D1,D2,D3]
-            //
-            // With same input for both args:
-            //   -> [L0,L1,L2,L3, L0,L1,L2,L3, H0,H1,H2,H3, H0,H1,H2,H3]
-            //
-            // After packus_epi16: bytes at [0,1,2,3, 0,1,2,3, 4,5,6,7, 4,5,6,7]
-            // We need bytes: [0,1,2,3, 4,5,6,7] from indices [0,1,2,3, 8,9,10,11]
-
+            // Both packs operate independently in each 128-bit lane. The first
+            // four bytes of the low lane are pixels 0..3; the first four bytes of
+            // the high lane are pixels 4..7. Join those groups before the 8-byte store.
             let y_16 = _mm256_packs_epi32(y_val, y_val);
             let u_16 = _mm256_packs_epi32(u_val, u_val);
             let v_16 = _mm256_packs_epi32(v_val, v_val);
-
             let y_8 = _mm256_packus_epi16(y_16, y_16);
             let u_8 = _mm256_packus_epi16(u_16, u_16);
             let v_8 = _mm256_packus_epi16(v_16, v_16);
-
-            // Use shuffle to reorder bytes from [0,1,2,3,x,x,x,x,4,5,6,7,x,x,x,x]
-            // to [0,1,2,3,4,5,6,7,x,x,x,x,x,x,x,x]
-            // Shuffle mask: pick bytes 0,1,2,3,8,9,10,11 and put them in first 8 positions
-            let shuffle_mask = _mm_setr_epi8(
-                0, 1, 2, 3, 8, 9, 10, 11, // First 8 bytes we want
-                -1, -1, -1, -1, -1, -1, -1, -1, // Don't care
+            let y_result = _mm_unpacklo_epi32(
+                _mm256_castsi256_si128(y_8),
+                _mm256_extracti128_si256(y_8, 1),
             );
-
-            // Extract 128-bit lane and shuffle
-            let y_result = _mm_shuffle_epi8(_mm256_castsi256_si128(y_8), shuffle_mask);
-            let u_result = _mm_shuffle_epi8(_mm256_castsi256_si128(u_8), shuffle_mask);
-            let v_result = _mm_shuffle_epi8(_mm256_castsi256_si128(v_8), shuffle_mask);
+            let u_result = _mm_unpacklo_epi32(
+                _mm256_castsi256_si128(u_8),
+                _mm256_extracti128_si256(u_8, 1),
+            );
+            let v_result = _mm_unpacklo_epi32(
+                _mm256_castsi256_si128(v_8),
+                _mm256_extracti128_si256(v_8, 1),
+            );
 
             // Store 8 bytes each using storel (stores low 64 bits)
             let y_ptr = frame.y.as_mut_ptr().add(base) as *mut i64;
@@ -1130,6 +1118,60 @@ mod tests {
     // =================================================================
     // SIMD-Exercising Tests
     // =================================================================
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_conversion_preserves_distinct_pixel_order_across_rows_and_remainders() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for (width, height) in [(8, 1), (11, 3), (16, 2), (35, 5)] {
+            let pixels: Vec<u8> = (0..width * height)
+                .flat_map(|pixel| {
+                    let value = pixel as u8;
+                    [
+                        value.wrapping_mul(17),
+                        value.wrapping_mul(37).wrapping_add(9),
+                        value.wrapping_mul(73).wrapping_add(42),
+                        255,
+                    ]
+                })
+                .collect();
+            for matrix in [
+                ColorMatrix::BT601,
+                ColorMatrix::BT709,
+                ColorMatrix::OpenH264,
+            ] {
+                let mut scalar = Yuv444Frame::new(width, height);
+                bgra_to_yuv444_scalar(&pixels, &mut scalar, matrix);
+                let actual = bgra_to_yuv444(&pixels, width, height, matrix);
+                assert_eq!(actual.y, scalar.y, "Y: {width}x{height}, {matrix:?}");
+                assert_eq!(actual.u, scalar.u, "U: {width}x{height}, {matrix:?}");
+                assert_eq!(actual.v, scalar.v, "V: {width}x{height}, {matrix:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn subsampling_preserves_nonuniform_blocks_across_simd_lanes_and_remainders() {
+        for (width, height) in [(32, 2), (34, 6), (66, 4)] {
+            let input: Vec<u8> = (0..width * height)
+                .map(|pixel| (pixel as u8).wrapping_mul(53).wrapping_add(11))
+                .collect();
+            let mut expected = Vec::new();
+            for y in 0..height / 2 {
+                for x in 0..width / 2 {
+                    let index = 2 * y * width + 2 * x;
+                    let sum = u16::from(input[index])
+                        + u16::from(input[index + 1])
+                        + u16::from(input[index + width])
+                        + u16::from(input[index + width + 1]);
+                    expected.push(((sum + 2) / 4) as u8);
+                }
+            }
+            assert_eq!(subsample_chroma_420(&input, width, height), expected);
+        }
+    }
 
     /// Test with 8 pixels (minimum SIMD batch size)
     #[test]

@@ -107,6 +107,15 @@ use crate::{
 #[cfg(feature = "vaapi")]
 use crate::rdp::channels::graphics::egfx::create_hardware_encoder;
 
+pub(super) fn avc444_encoder_enabled(
+    config: &crate::config::Config,
+    negotiated_mode: Option<NegotiatedEgfxMode>,
+) -> bool {
+    !config.egfx.codec.eq_ignore_ascii_case("avc420")
+        && config.egfx.avc444_enabled
+        && negotiated_mode == Some(NegotiatedEgfxMode::Avc444)
+}
+
 /// Client-initiated resize request
 ///
 /// Recorded by `request_layout()` (sync context) and consumed by the pipeline
@@ -2271,58 +2280,18 @@ impl DisplayChannelHandler {
                             color_space.description()
                         );
 
-                        // Determine codec based on config preference and client capabilities
-                        // Config codec setting: "auto", "avc420", "avc444"
+                        // Production normalizes the codec policy before constructing
+                        // this pipeline and the EGFX capability handler.
                         let negotiated_mode = handler.negotiated_egfx_mode().await;
-                        let client_supports_avc444 =
-                            negotiated_mode == Some(NegotiatedEgfxMode::Avc444);
                         if let Some(mode) = negotiated_mode {
                             info!("Client EGFX negotiated mode: {}", mode.name());
                         }
-
-                        // Resolve codec preference from config
-                        let codec_pref = self.config.egfx.codec.to_lowercase();
-                        let avc444_enabled = match codec_pref.as_str() {
-                            "avc420" => {
-                                info!("Codec preference: AVC420 forced by config");
-                                false
-                            }
-                            "avc444" => {
-                                if client_supports_avc444 && self.config.egfx.avc444_enabled {
-                                    info!("Codec preference: AVC444 requested and supported");
-                                    true
-                                } else if !client_supports_avc444 {
-                                    info!(
-                                        "Codec preference: AVC444 requested but client doesn't support it, using AVC420"
-                                    );
-                                    false
-                                } else {
-                                    info!(
-                                        "Codec preference: AVC444 requested but disabled in config, using AVC420"
-                                    );
-                                    false
-                                }
-                            }
-                            _ => {
-                                // "auto" or unrecognized: use best available
-                                if self.config.egfx.avc444_enabled && client_supports_avc444 {
-                                    info!(
-                                        "Codec preference: auto → AVC444 (client supports, enabled in config)"
-                                    );
-                                    true
-                                } else if !self.config.egfx.avc444_enabled {
-                                    info!(
-                                        "Codec preference: auto → AVC420 (AVC444 disabled in config)"
-                                    );
-                                    false
-                                } else {
-                                    info!(
-                                        "Codec preference: auto → AVC420 (client doesn't support AVC444)"
-                                    );
-                                    false
-                                }
-                            }
-                        };
+                        let avc444_enabled = avc444_encoder_enabled(&self.config, negotiated_mode);
+                        info!(
+                            configured = %self.config.egfx.codec,
+                            avc444_enabled,
+                            "display encoder codec selected"
+                        );
 
                         // ── Hardware encoder (VA-API) ──────────────────────
                         // Try hardware encoding first when enabled in config.

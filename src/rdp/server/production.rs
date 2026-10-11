@@ -69,12 +69,37 @@ use crate::{
 fn effective_codec_policy(
     configured: crate::rdp::server::EgfxCodecPolicy,
     hardware_enabled: bool,
+    avc444_enabled: bool,
 ) -> crate::rdp::server::EgfxCodecPolicy {
-    if configured == crate::rdp::server::EgfxCodecPolicy::Auto && hardware_enabled {
-        crate::rdp::server::EgfxCodecPolicy::Avc420
-    } else {
-        configured
+    use crate::rdp::server::EgfxCodecPolicy;
+
+    match configured {
+        EgfxCodecPolicy::Auto if hardware_enabled || !avc444_enabled => EgfxCodecPolicy::Avc420,
+        EgfxCodecPolicy::Avc444 if !avc444_enabled => EgfxCodecPolicy::Avc420,
+        _ => configured,
     }
+}
+
+fn normalize_codec_policy(config: &mut Config) -> Result<crate::rdp::server::EgfxCodecPolicy> {
+    use crate::rdp::server::EgfxCodecPolicy;
+
+    let configured = EgfxCodecPolicy::parse(&config.egfx.codec).context("invalid egfx.codec")?;
+    let policy = effective_codec_policy(
+        configured,
+        config.hardware_encoding.enabled,
+        config.egfx.avc444_enabled,
+    );
+    // Both capability negotiation and the display encoder must see the same
+    // policy. Otherwise disabling AVC444 can leave the sender restricted to
+    // AVC444 while the display pipeline creates an AVC420 encoder.
+    match policy {
+        EgfxCodecPolicy::Auto => "auto",
+        EgfxCodecPolicy::Avc420 => "avc420",
+        EgfxCodecPolicy::Avc444 => "avc444",
+        EgfxCodecPolicy::Bitmap => "bitmap",
+    }
+    .clone_into(&mut config.egfx.codec);
+    Ok(policy)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,7 +307,7 @@ fn accept_retry_delay(consecutive_errors: u32) -> Duration {
     Duration::from_millis((10_u64 << shift).min(MAX_ACCEPT_RETRY_DELAY.as_millis() as u64))
 }
 
-pub async fn run(config: Config) -> Result<()> {
+pub async fn run(mut config: Config) -> Result<()> {
     info!("starting wrdp production single-daemon listener");
 
     tokio::task::spawn_blocking(crate::sesman::reconcile_production_sessions)
@@ -318,14 +343,9 @@ pub async fn run(config: Config) -> Result<()> {
     let fatal_shutdown_error: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
     let audio_target = AudioTarget::default();
 
-    let configured_codec_policy = crate::rdp::server::EgfxCodecPolicy::parse(&config.egfx.codec)
-        .context("invalid egfx.codec")?;
-    // The VA-API implementation produces AVC420. Selecting AVC444 under
-    // `auto` would negotiate an incompatible sender and then require a software
-    // OpenH264 module that may not be installed. Keep auto aligned with the
-    // enabled hardware encoder; operators can still explicitly request AVC444.
-    let codec_policy =
-        effective_codec_policy(configured_codec_policy, config.hardware_encoding.enabled);
+    // VA-API produces AVC420. Resolve auto and the AVC444 enable switch before
+    // constructing either consumer, so negotiation and encoding stay aligned.
+    let codec_policy = normalize_codec_policy(&mut config)?;
     let (gfx_factory, gfx_server_handle, gfx_handler_state) =
         if config.egfx.enabled && codec_policy != crate::rdp::server::EgfxCodecPolicy::Bitmap {
             let compression_mode = match config.egfx.zgfx_compression.to_lowercase().as_str() {
@@ -1957,17 +1977,108 @@ mod tests {
     #[test]
     fn hardware_auto_policy_uses_avc420() {
         assert_eq!(
-            effective_codec_policy(EgfxCodecPolicy::Auto, true),
+            effective_codec_policy(EgfxCodecPolicy::Auto, true, true),
             EgfxCodecPolicy::Avc420
         );
         assert_eq!(
-            effective_codec_policy(EgfxCodecPolicy::Auto, false),
+            effective_codec_policy(EgfxCodecPolicy::Auto, false, true),
             EgfxCodecPolicy::Auto
         );
         assert_eq!(
-            effective_codec_policy(EgfxCodecPolicy::Avc444, true),
+            effective_codec_policy(EgfxCodecPolicy::Avc444, true, true),
             EgfxCodecPolicy::Avc444
         );
+    }
+
+    #[test]
+    fn disabled_avc444_aligns_negotiation_and_display_encoder() {
+        use crate::rdp::channels::graphics::egfx::WrdpGraphicsHandler;
+        use crate::rdp::server::{HandlerState, NegotiatedEgfxMode};
+        use ironrdp_egfx::{
+            pdu::{CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet},
+            server::GraphicsPipelineHandler,
+        };
+
+        let capabilities = [
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::empty(),
+            },
+            CapabilitySet::V10_1,
+            CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::AVC420_ENABLED,
+            },
+        ];
+        for configured in ["auto", "avc444"] {
+            for hardware_enabled in [false, true] {
+                for cap in &capabilities {
+                    let mut config = Config::default();
+                    config.egfx.codec = configured.to_owned();
+                    config.egfx.avc444_enabled = false;
+                    config.hardware_encoding.enabled = hardware_enabled;
+                    let policy = normalize_codec_policy(&mut config).unwrap();
+                    assert_eq!(policy, EgfxCodecPolicy::Avc420);
+                    assert_eq!(config.egfx.codec, "avc420");
+
+                    let shared = Arc::new(tokio::sync::RwLock::new(None::<HandlerState>));
+                    let mut handler = WrdpGraphicsHandler::with_config(
+                        1280,
+                        800,
+                        shared.clone(),
+                        policy,
+                        config.egfx.max_frames_in_flight,
+                    );
+                    handler.on_ready(cap);
+                    let guard = shared.try_read().unwrap();
+                    let state = guard.as_ref().unwrap();
+                    assert_eq!(state.negotiated_mode, Some(NegotiatedEgfxMode::Avc420));
+                    assert!(state.is_avc420_enabled);
+                    assert!(!state.is_avc444_enabled);
+                    assert!(
+                        !crate::rdp::server::display_handler::avc444_encoder_enabled(
+                            &config,
+                            state.negotiated_mode,
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn enabled_avc444_keeps_auto_negotiation_and_encoder_aligned() {
+        use crate::rdp::channels::graphics::egfx::WrdpGraphicsHandler;
+        use crate::rdp::server::{HandlerState, NegotiatedEgfxMode};
+        use ironrdp_egfx::{
+            pdu::{CapabilitiesV107Flags, CapabilitySet},
+            server::GraphicsPipelineHandler,
+        };
+
+        let mut config = Config::default();
+        config.egfx.codec = "auto".to_owned();
+        config.egfx.avc444_enabled = true;
+        config.hardware_encoding.enabled = false;
+        let policy = normalize_codec_policy(&mut config).unwrap();
+        assert_eq!(policy, EgfxCodecPolicy::Auto);
+        let shared = Arc::new(tokio::sync::RwLock::new(None::<HandlerState>));
+        let mut handler = WrdpGraphicsHandler::with_config(
+            1280,
+            800,
+            shared.clone(),
+            policy,
+            config.egfx.max_frames_in_flight,
+        );
+        handler.on_ready(&CapabilitySet::V10_7 {
+            flags: CapabilitiesV107Flags::empty(),
+        });
+        let guard = shared.try_read().unwrap();
+        let state = guard.as_ref().unwrap();
+        assert_eq!(state.negotiated_mode, Some(NegotiatedEgfxMode::Avc444));
+        assert!(!state.is_avc420_enabled);
+        assert!(state.is_avc444_enabled);
+        assert!(crate::rdp::server::display_handler::avc444_encoder_enabled(
+            &config,
+            state.negotiated_mode,
+        ));
     }
 
     #[test]

@@ -410,7 +410,7 @@ impl EgfxChannelSender {
 /// Convert DamageRegion list to Avc420Region list
 ///
 /// Clamps regions to display bounds and assigns QP values.
-/// Avc420Region uses left/top/right/bottom (inclusive LTRB) format.
+/// Avc420Region and RDPGFX_RECT16 use exclusive right/bottom bounds.
 fn damage_regions_to_avc420(
     regions: &[DamageRegion],
     display_width: u16,
@@ -419,24 +419,17 @@ fn damage_regions_to_avc420(
     regions
         .iter()
         .filter_map(|r| {
-            // Clamp to display bounds (LTRB format, inclusive)
+            // Clamp the exclusive rectangle to the visible display.
             if r.width == 0 || r.height == 0 || display_width == 0 || display_height == 0 {
                 return None;
             }
             let left = r.x.min(display_width as u32) as u16;
             let top = r.y.min(display_height as u32) as u16;
-            // Right and bottom are inclusive, so subtract 1 from the exclusive bounds
-            let right =
-                r.x.saturating_add(r.width)
-                    .min(display_width as u32)
-                    .saturating_sub(1) as u16;
-            let bottom =
-                r.y.saturating_add(r.height)
-                    .min(display_height as u32)
-                    .saturating_sub(1) as u16;
+            let right = r.x.saturating_add(r.width).min(display_width as u32) as u16;
+            let bottom = r.y.saturating_add(r.height).min(display_height as u32) as u16;
 
-            // Skip invalid regions (where right < left or bottom < top)
-            if right < left || bottom < top {
+            // Outside-display and empty rectangles carry no pixels.
+            if right <= left || bottom <= top {
                 return None;
             }
 
@@ -638,6 +631,50 @@ mod tests {
         assert!(EgfxChannelSender::validate_frame(&[1], 17, 16, 16, 16).is_err());
         assert!(EgfxChannelSender::validate_frame(&[1], 16, 31, 16, 16).is_err());
         assert!(EgfxChannelSender::validate_frame(&[1], 16, 16, 16, 16).is_ok());
+    }
+
+    #[test]
+    fn damage_conversion_preserves_exclusive_full_frame_and_corner_pixels() {
+        for damage in [
+            DamageRegion {
+                x: 0,
+                y: 0,
+                width: 1280,
+                height: 800,
+            },
+            DamageRegion {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            DamageRegion {
+                x: 1279,
+                y: 799,
+                width: 1,
+                height: 1,
+            },
+            DamageRegion {
+                x: 1279,
+                y: 799,
+                width: 10,
+                height: 10,
+            },
+        ] {
+            let regions = damage_regions_to_avc420(&[damage], 1280, 800);
+            assert_eq!(regions.len(), 1);
+            let rectangle = regions[0].to_rectangle();
+            assert_eq!(rectangle.left, damage.x as u16);
+            assert_eq!(rectangle.top, damage.y as u16);
+            assert_eq!(
+                rectangle.right,
+                damage.x.saturating_add(damage.width).min(1280) as u16
+            );
+            assert_eq!(
+                rectangle.bottom,
+                damage.y.saturating_add(damage.height).min(800) as u16
+            );
+        }
     }
 
     #[test]

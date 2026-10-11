@@ -145,6 +145,9 @@ pub struct VaapiEncoder {
     /// Frame counter
     frame_count: u64,
 
+    /// Frame number since the current IDR; H.264 uses eight-bit frame_num/POC.
+    gop_frame_count: u32,
+
     /// IDR frame interval
     idr_interval: u32,
 
@@ -256,13 +259,30 @@ impl VaapiEncoder {
         };
         info!("Using VA-API H.264 entrypoint: {:?}", encode_entrypoint);
 
+        // Mesa uses application-supplied slice/PPS headers to configure NAL type
+        // and entropy coding. Prefixing parameter sets after encoding is too late.
+        // Select packed headers explicitly, as required by the libva contract.
+        let packed_header_mask = libva::VA_ENC_PACKED_HEADER_SEQUENCE
+            | libva::VA_ENC_PACKED_HEADER_PICTURE
+            | libva::VA_ENC_PACKED_HEADER_SLICE;
+        let mut packed_attributes = [libva::VAConfigAttrib {
+            type_: libva::VAConfigAttribType::VAConfigAttribEncPackedHeaders,
+            value: 0,
+        }];
+        display
+            .get_config_attributes(h264_profile, encode_entrypoint, &mut packed_attributes)
+            .map_err(|e| VaapiError::ConfigCreateFailed(e.to_string()))?;
+        if packed_attributes[0].value == libva::VA_ATTRIB_NOT_SUPPORTED
+            || packed_attributes[0].value & packed_header_mask != packed_header_mask
+        {
+            return Err(HardwareEncoderError::UnsupportedConfig(
+                "H.264 packed sequence, picture and slice headers are required".to_string(),
+            ));
+        }
+        packed_attributes[0].value = packed_header_mask;
         // Create encode config
         let config = display
-            .create_config(
-                vec![], // Use default attributes
-                h264_profile,
-                encode_entrypoint,
-            )
+            .create_config(packed_attributes.to_vec(), h264_profile, encode_entrypoint)
             .map_err(|e| VaapiError::ConfigCreateFailed(e.to_string()))?;
 
         // Create input surfaces (for uploading NV12 data)
@@ -388,6 +408,7 @@ impl VaapiEncoder {
             profile_idc,
             preset,
             frame_count: 0,
+            gop_frame_count: 0,
             idr_interval,
             force_idr: true, // First frame is always IDR
             stats,
@@ -449,7 +470,7 @@ impl VaapiEncoder {
 
     /// Builds Annex-B SPS/PPS NAL units matching the VA sequence and picture
     /// parameter buffers submitted by this encoder.
-    fn build_parameter_sets(&self) -> Vec<u8> {
+    fn build_packed_parameter_sets(&self) -> [Vec<u8>; 2] {
         let mb_width = self.width.div_ceil(16);
         let mb_height = self.height.div_ceil(16);
         let crop_right = mb_width * 16 - self.width;
@@ -528,9 +549,70 @@ impl VaapiEncoder {
         }
         let pps = annex_b_nal(0x68, pps.finish_rbsp());
 
-        let mut parameter_sets = sps;
-        parameter_sets.extend_from_slice(&pps);
-        parameter_sets
+        [sps, pps]
+    }
+
+    fn build_parameter_sets(&self) -> Vec<u8> {
+        self.build_packed_parameter_sets().concat()
+    }
+
+    fn create_packed_header(
+        &self,
+        kind: u32,
+        data: Vec<u8>,
+    ) -> HardwareEncoderResult<[libva::Buffer; 2]> {
+        let bit_length = u32::try_from(data.len() * 8).map_err(|_| {
+            HardwareEncoderError::EncodeFailed("packed header too large".to_string())
+        })?;
+        let parameter = libva::VAEncPackedHeaderParameterBuffer {
+            type_: kind,
+            bit_length,
+            has_emulation_bytes: 1,
+            ..Default::default()
+        };
+        let metadata = self
+            .context
+            .create_buffer(BufferType::EncPackedHeaderParameter(parameter))
+            .map_err(|e| {
+                HardwareEncoderError::EncodeFailed(format!("packed header metadata: {e}"))
+            })?;
+        let payload = self
+            .context
+            .create_buffer(BufferType::EncPackedHeaderData(data))
+            .map_err(|e| HardwareEncoderError::EncodeFailed(format!("packed header data: {e}")))?;
+        Ok([metadata, payload])
+    }
+
+    fn build_packed_slice(&self, is_idr: bool, frame_num: u16, poc: i32) -> Vec<u8> {
+        let mut slice = H264BitWriter::default();
+        slice.write_ue(0); // first_mb_in_slice
+        slice.write_ue(if is_idr { 2 } else { 0 });
+        slice.write_ue(0); // pic_parameter_set_id
+        slice.write_bits(u32::from(frame_num), 8);
+        if is_idr {
+            slice.write_ue(0);
+        } // idr_pic_id
+        slice.write_bits(poc as u32 & 255, 8);
+        if !is_idr {
+            slice.write_bit(true); // num_ref_idx_active_override_flag
+            slice.write_ue(0); // one L0 reference
+            slice.write_bit(false); // ref_pic_list_modification_flag_l0
+        }
+        if is_idr {
+            slice.write_bit(false); // no_output_of_prior_pics_flag
+            slice.write_bit(false); // long_term_reference_flag
+        } else {
+            slice.write_bit(false); // adaptive_ref_pic_marking_mode_flag
+            slice.write_ue(0); // cabac_init_idc
+        }
+        slice.write_se(0); // slice_qp_delta
+        slice.write_ue(0); // disable_deblocking_filter_idc
+        slice.write_se(0);
+        slice.write_se(0);
+        annex_b_nal(
+            if is_idr { 0x65 } else { 0x41 },
+            slice.finish_cabac_header(),
+        )
     }
 
     fn extract_sps_pps(data: &[u8]) -> Option<Vec<u8>> {
@@ -739,6 +821,7 @@ impl HardwareEncoder for VaapiEncoder {
         if is_idr {
             // Reset DPB on IDR
             self.last_ref = None;
+            self.gop_frame_count = 0;
 
             let seq_param = self.build_sequence_params(mb_width as u16, mb_height as u16);
             let seq_buffer = self
@@ -750,6 +833,18 @@ impl HardwareEncoder for VaapiEncoder {
                     HardwareEncoderError::EncodeFailed(format!("Failed to create seq buffer: {e}"))
                 })?;
             picture.add_buffer(seq_buffer);
+            let [sps, pps] = self.build_packed_parameter_sets();
+            for buffer in self.create_packed_header(
+                libva::VAEncPackedHeaderType::VAEncPackedHeaderSequence,
+                sps,
+            )? {
+                picture.add_buffer(buffer);
+            }
+            for buffer in self
+                .create_packed_header(libva::VAEncPackedHeaderType::VAEncPackedHeaderPicture, pps)?
+            {
+                picture.add_buffer(buffer);
+            }
 
             // Submit rate control parameters on IDR (driver caches them)
             for rc_buf_type in self.build_rate_control_buffers() {
@@ -765,8 +860,8 @@ impl HardwareEncoder for VaapiEncoder {
         // Build picture params with reference frame tracking.
         // CurrPic uses the RECONSTRUCTED surface (where the encoder writes its output).
         // reference_frames contains the last reconstructed frame for P-frame prediction.
-        let frame_num = (self.frame_count % 65536) as u16;
-        let poc = (self.frame_count * 2) as i32;
+        let frame_num = (self.gop_frame_count % 256) as u16;
+        let poc = (self.gop_frame_count * 2) as i32;
 
         let pic_param = self.build_picture_params(
             self.recon_surfaces[recon_idx].id(),
@@ -796,6 +891,12 @@ impl HardwareEncoder for VaapiEncoder {
                 HardwareEncoderError::EncodeFailed(format!("Failed to create slice buffer: {e}"))
             })?;
         picture.add_buffer(slice_buffer);
+        for buffer in self.create_packed_header(
+            libva::VAEncPackedHeaderType::VAEncPackedHeaderSlice,
+            self.build_packed_slice(is_idr, frame_num, poc),
+        )? {
+            picture.add_buffer(buffer);
+        }
 
         // Execute encoding pipeline: begin -> render -> end -> sync
         let picture = picture.begin().map_err(|e| {
@@ -828,8 +929,14 @@ impl HardwareEncoder for VaapiEncoder {
             encoded_data.extend_from_slice(segment.buf);
         }
 
-        // The Intel low-power entrypoint emits slice NALs but no packed SPS/PPS.
-        // Supply parameter sets that exactly match the VA sequence/picture buffers.
+        if !Self::contains_nal_type(&encoded_data, if is_idr { 5 } else { 1 }) {
+            return Err(HardwareEncoderError::EncodeFailed(
+                "driver emitted no matching H.264 coded slice".to_string(),
+            ));
+        }
+
+        // Keep IDR parameter sets on the wire even if a driver omits them from
+        // coded output. They match the packed headers submitted for this picture.
         if is_idr {
             let has_sps = Self::contains_nal_type(&encoded_data, 7);
             let has_pps = Self::contains_nal_type(&encoded_data, 8);
@@ -861,6 +968,7 @@ impl HardwareEncoder for VaapiEncoder {
 
         let frame_size = encoded_data.len();
         self.frame_count += 1;
+        self.gop_frame_count += 1;
 
         Ok(Some(H264Frame {
             data: encoded_data,
@@ -1512,6 +1620,15 @@ impl H264BitWriter {
         self.write_ue(code_num);
     }
 
+    /// H.264 cabac_alignment_one_bit pads the slice header before coded data.
+    /// Unlike a complete RBSP, the header does not have rbsp_trailing_bits.
+    fn finish_cabac_header(mut self) -> Vec<u8> {
+        while self.used != 0 {
+            self.write_bit(true);
+        }
+        self.bytes
+    }
+
     fn finish_rbsp(mut self) -> Vec<u8> {
         self.write_bit(true);
         while self.used != 0 {
@@ -1552,11 +1669,14 @@ mod tests {
         ));
     }
 
-    /// Live Intel/AMD VA-API smoke test. Ignored in normal CI because it
-    /// requires a render node and a working H.264 encode driver.
+    /// Decode IDR/P/forced-IDR output, rather than accepting nonempty SPS/PPS.
     #[test]
-    #[ignore = "requires /dev/dri/renderD128 and a VA-API H.264 encoder"]
+    #[ignore = "requires renderD128, VA-API H.264 encode and ffmpeg"]
     fn vaapi_hardware_encode_smoke() {
+        use std::{
+            io::Write as _,
+            process::{Command, Stdio},
+        };
         let config = HardwareEncodingConfig {
             enabled: true,
             ..HardwareEncodingConfig::default()
@@ -1565,36 +1685,101 @@ mod tests {
         let height = 720;
         let mut encoder = VaapiEncoder::new(&config, width, height, QualityPreset::Speed)
             .expect("VA-API encoder must initialize");
-        let frame = vec![0x20; (width * height * 4) as usize];
-        let encoded = encoder
-            .encode_bgra(&frame, width, height, 0)
-            .expect("VA-API frame encode must succeed")
-            .expect("VA-API must emit the first IDR frame");
-        assert!(!encoded.data.is_empty(), "encoded H.264 payload is empty");
-        let mut nal_types = Vec::new();
-        let mut i = 0;
-        while i + 3 < encoded.data.len() {
-            let start_len = if encoded.data[i..].starts_with(&[0, 0, 0, 1]) {
-                4
-            } else if encoded.data[i..].starts_with(&[0, 0, 1]) {
-                3
-            } else {
-                i += 1;
-                continue;
-            };
-            if i + start_len < encoded.data.len() {
-                nal_types.push(encoded.data[i + start_len] & 0x1f);
+        let mut bitstream = Vec::new();
+        let mut frame = vec![0; (width * height * 4) as usize];
+        for index in 0..12 {
+            if index == 4 || index == 8 {
+                encoder.force_keyframe();
             }
-            i += start_len;
+            for (pixel, bgra) in frame.chunks_exact_mut(4).enumerate() {
+                let x = pixel % width as usize;
+                let y = pixel / width as usize;
+                bgra.copy_from_slice(&[
+                    ((x / 8 + index * 5) % 128 + 32) as u8,
+                    ((y / 8 + index * 7) % 128 + 32) as u8,
+                    ((x / 16 + y / 16 + index * 3) % 160 + 32) as u8,
+                    255,
+                ]);
+            }
+            let encoded = encoder
+                .encode_bgra(&frame, width, height, index as u64 * 33)
+                .expect("VA-API encode must succeed")
+                .expect("VA-API must emit a coded picture");
+            assert!(
+                VaapiEncoder::contains_nal_type(
+                    &encoded.data,
+                    if encoded.is_keyframe { 5 } else { 1 }
+                ),
+                "coded output must contain an IDR or P slice"
+            );
+            bitstream.extend_from_slice(&encoded.data);
         }
+        let decoder = std::env::var_os("WRDP_TEST_H264_DECODER").unwrap_or_else(|| "ffmpeg".into());
+        let mut child = Command::new(decoder)
+            .args([
+                "-v",
+                "error",
+                "-err_detect",
+                "explode",
+                "-threads",
+                "1",
+                "-f",
+                "h264",
+                "-i",
+                "pipe:0",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "gray",
+                "pipe:1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("ffmpeg decoder must start");
+        let mut stdin = child.stdin.take().expect("decoder stdin must be piped");
+        // Drain decoded output while writing the stream, so neither pipe can
+        // block the other after filling its kernel buffer.
+        let writer = std::thread::spawn(move || stdin.write_all(&bitstream));
+        let output = child.wait_with_output().expect("decoder must finish");
+        writer
+            .join()
+            .expect("decoder writer must join")
+            .expect("decoder must consume H.264");
         assert!(
-            nal_types.contains(&7),
-            "IDR is missing SPS; NAL types={nal_types:?}"
+            output.status.success(),
+            "decoder failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            nal_types.contains(&8),
-            "IDR is missing PPS; NAL types={nal_types:?}"
+            output.stderr.is_empty(),
+            "decoder reported errors: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
+        let pixels = (width * height) as usize;
+        assert_eq!(
+            output.stdout.len(),
+            12 * pixels,
+            "decoder must produce all pictures"
+        );
+        for luma in output.stdout.chunks_exact(pixels) {
+            let (min, max) = (luma.iter().min().unwrap(), luma.iter().max().unwrap());
+            assert!(
+                *max - *min > 16,
+                "decoded output must preserve the test pattern"
+            );
+        }
+    }
+
+    #[test]
+    fn cabac_header_padding_uses_only_alignment_ones() {
+        let mut header = H264BitWriter::default();
+        header.write_bits(0b10, 2);
+        assert_eq!(header.finish_cabac_header(), vec![0b1011_1111]);
+        let mut aligned = H264BitWriter::default();
+        aligned.write_bits(0x65, 8);
+        assert_eq!(aligned.finish_cabac_header(), vec![0x65]);
     }
 
     #[test]

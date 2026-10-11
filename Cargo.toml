@@ -142,7 +142,7 @@ libloading = { version = "0.8", optional = true }
 # -----------------------------------------------------------------------------
 # VA-API: Intel/AMD GPU encoding (ChromeOS bindings)
 # Requires libva-dev 1.20.0+ installed
-cros-libva = { version = "0.0.13", optional = true }
+cros-libva = { git = "https://github.com/wignerStan/cros-libva.git", rev = "c6ef66f62920e6893bbe9f5fc0cab83686424a86", optional = true }
 
 # -----------------------------------------------------------------------------
 # System and utilities

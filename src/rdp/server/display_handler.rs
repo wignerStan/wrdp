@@ -116,6 +116,16 @@ pub(super) fn avc444_encoder_enabled(
         && negotiated_mode == Some(NegotiatedEgfxMode::Avc444)
 }
 
+#[cfg(feature = "vaapi")]
+fn hardware_encoder_enabled(
+    config: &crate::config::Config,
+    negotiated_mode: Option<NegotiatedEgfxMode>,
+) -> bool {
+    // This backend emits a single AVC420 stream. AVC444 must retain its dual
+    // software encoder until a hardware backend implements that wire format.
+    config.hardware_encoding.enabled && negotiated_mode == Some(NegotiatedEgfxMode::Avc420)
+}
+
 /// Client-initiated resize request
 ///
 /// Recorded by `request_layout()` (sync context) and consumed by the pipeline
@@ -2294,10 +2304,10 @@ impl DisplayChannelHandler {
                         );
 
                         // ── Hardware encoder (VA-API) ──────────────────────
-                        // Try hardware encoding first when enabled in config.
+                        // Hardware supports the negotiated AVC420 wire format only.
                         #[cfg(feature = "vaapi")]
                         {
-                            if self.config.hardware_encoding.enabled
+                            if hardware_encoder_enabled(&self.config, negotiated_mode)
                                 && !hardware_encoding_runtime_disabled
                             {
                                 let hardware_config = self.config.hardware_encoding.clone();
@@ -2352,24 +2362,11 @@ impl DisplayChannelHandler {
                                     }
                                     Err(e) => {
                                         warn!(
-                                            "Failed to create AVC444 encoder: {:?} - falling back to AVC420",
+                                            "Failed to create AVC444 encoder: {:?}; using bitmap fallback",
                                             e
                                         );
-                                        match Avc420Encoder::new(config) {
-                                            Ok(encoder) => {
-                                                video_encoder = Some(VideoEncoder::Avc420(encoder));
-                                                info!(
-                                                    "✅ AVC420 encoder initialized for {}×{} (4:2:0 fallback)",
-                                                    encoded_width, encoded_height
-                                                );
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    "Failed to create AVC420 encoder: {:?} - falling back to RemoteFX",
-                                                    e
-                                                );
-                                            }
-                                        }
+                                        // A single AVC420 stream conflicts with negotiated
+                                        // AVC444. Do not create an incompatible fallback.
                                     }
                                 }
                             } else {
@@ -3551,6 +3548,29 @@ mod tests {
             compact.data.as_slice(),
             &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
+    }
+
+    #[test]
+    #[cfg(feature = "vaapi")]
+    fn hardware_encoder_matches_only_avc420_negotiation() {
+        let mut config = crate::config::Config::default();
+        config.hardware_encoding.enabled = true;
+        assert!(hardware_encoder_enabled(
+            &config,
+            Some(NegotiatedEgfxMode::Avc420)
+        ));
+        for mode in [
+            None,
+            Some(NegotiatedEgfxMode::Avc444),
+            Some(NegotiatedEgfxMode::Bitmap),
+        ] {
+            assert!(!hardware_encoder_enabled(&config, mode));
+        }
+        config.hardware_encoding.enabled = false;
+        assert!(!hardware_encoder_enabled(
+            &config,
+            Some(NegotiatedEgfxMode::Avc420)
+        ));
     }
 
     #[test]

@@ -13,3 +13,4 @@
 | [0009](0009-persist-session-process-identity.md) | Persist PID reuse-safe process identity for sessions | accepted |
 | [0010](0010-use-one-server-lifecycle.md) | Use one RDP listener and connection lifecycle | accepted |
 | [0011](0011-own-session-audio.md) | Own audio in the managed desktop session | accepted |
+| [0012](0012-match-h264-driver-and-wire-headers.md) | Match H.264 packed driver headers, negotiated codec, and exclusive region bounds | accepted |

@@ -39,12 +39,23 @@ latency rather than guaranteeing packet size.
   Per-worker deinitialization breaks the next connection and can invalidate
   another active worker. The [crate deinit contract](https://docs.rs/pipewire/0.9.2/pipewire/fn.deinit.html)
   permits it only once after all threads and resources have stopped.
+- The protocol owner stops the audio producer and writes one RDPSND Close PDU
+  before a server-initiated disconnect and its unchanged error notice. Queued
+  waves in that disconnect batch are discarded. No delay or acknowledgement
+  wait is introduced.
+- A forwarding gate covers only nonblocking event sends. Stopping the backend
+  disables that gate before task abort. An old producer cannot queue a Wave or
+  Close after teardown for delivery to another connection.
+- After Close, waves and settings require renewed format negotiation. This
+  follows [MS-RDPEA 3.2.5.2.1.7](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpea/cb7e9d2b-43cb-4109-913b-8412c3aca443).
 - Client microphone redirection is a separate channel and is not enabled here.
 
 ## Validation boundary
 
 Unit tests verify the serialized SPA format, PCM byte decoding, cancellation,
-and bounded socket readiness. Provisioning tests verify package and resource
+and bounded socket readiness. Protocol tests decode Close before the error
+notice and verify that later waves cannot pass Close. Lifecycle tests reject
+late forwarding events after stop. Provisioning tests verify package and resource
 ownership. Actual playback needs a client-side signal capture across a real
 RDPSND connection; socket presence or a negotiated format alone is not evidence
 of audible output.

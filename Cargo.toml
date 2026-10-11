@@ -34,7 +34,7 @@ path = "src/lib.rs"
 # -----------------------------------------------------------------------------
 # Wayland/RDP support crates
 # -----------------------------------------------------------------------------
-# NOTE: IronRDP stays pinned to the wrdp branch while upstream server-side
+# NOTE: IronRDP stays pinned to a WRDP-compatible revision while server-side
 # changes are upstreamed and released on crates.io.
 
 # -----------------------------------------------------------------------------
@@ -74,18 +74,18 @@ x509-cert = "0.2.5"
 
 # -----------------------------------------------------------------------------
 # RDP protocol (IronRDP)
-# One canonical upstream revision includes merged connection-binding and ACK fixes.
+# One fork revision adds ordered audio teardown to the WRDP-compatible base.
 # Keep all IronRDP crates aligned to avoid cross-revision type mismatches.
-ironrdp-server = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e4143f26306a6639a889d80c1c484ca69c365a8f", features = ["egfx", "helper"] }
-ironrdp-pdu = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e4143f26306a6639a889d80c1c484ca69c365a8f" }
-ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e4143f26306a6639a889d80c1c484ca69c365a8f" }
-ironrdp-cliprdr = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e4143f26306a6639a889d80c1c484ca69c365a8f" }
-ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e4143f26306a6639a889d80c1c484ca69c365a8f" }
-ironrdp-egfx = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e4143f26306a6639a889d80c1c484ca69c365a8f" }
-ironrdp-svc = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e4143f26306a6639a889d80c1c484ca69c365a8f" }
-ironrdp-dvc = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e4143f26306a6639a889d80c1c484ca69c365a8f" }
-ironrdp-graphics = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e4143f26306a6639a889d80c1c484ca69c365a8f" }
-ironrdp-rdpsnd = { git = "https://github.com/Devolutions/IronRDP.git", rev = "e4143f26306a6639a889d80c1c484ca69c365a8f" }
+ironrdp-server = { git = "https://github.com/wignerStan/IronRDP.git", rev = "5435e59bbe6cd0ae32839b8cafe5300d42950fe3", features = ["egfx", "helper"] }
+ironrdp-pdu = { git = "https://github.com/wignerStan/IronRDP.git", rev = "5435e59bbe6cd0ae32839b8cafe5300d42950fe3" }
+ironrdp-displaycontrol = { git = "https://github.com/wignerStan/IronRDP.git", rev = "5435e59bbe6cd0ae32839b8cafe5300d42950fe3" }
+ironrdp-cliprdr = { git = "https://github.com/wignerStan/IronRDP.git", rev = "5435e59bbe6cd0ae32839b8cafe5300d42950fe3" }
+ironrdp-core = { git = "https://github.com/wignerStan/IronRDP.git", rev = "5435e59bbe6cd0ae32839b8cafe5300d42950fe3" }
+ironrdp-egfx = { git = "https://github.com/wignerStan/IronRDP.git", rev = "5435e59bbe6cd0ae32839b8cafe5300d42950fe3" }
+ironrdp-svc = { git = "https://github.com/wignerStan/IronRDP.git", rev = "5435e59bbe6cd0ae32839b8cafe5300d42950fe3" }
+ironrdp-dvc = { git = "https://github.com/wignerStan/IronRDP.git", rev = "5435e59bbe6cd0ae32839b8cafe5300d42950fe3" }
+ironrdp-graphics = { git = "https://github.com/wignerStan/IronRDP.git", rev = "5435e59bbe6cd0ae32839b8cafe5300d42950fe3" }
+ironrdp-rdpsnd = { git = "https://github.com/wignerStan/IronRDP.git", rev = "5435e59bbe6cd0ae32839b8cafe5300d42950fe3" }
 
 # -----------------------------------------------------------------------------
 

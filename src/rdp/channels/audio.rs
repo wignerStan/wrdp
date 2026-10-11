@@ -8,7 +8,7 @@ use ironrdp_rdpsnd::{
 };
 use ironrdp_server::{RdpsndServerMessage, ServerEvent, ServerEventSender, SoundServerFactory};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::desktop::pipewire::audio::{
     AudioFormat as CaptureFormat, AudioSamples, CaptureConfig, spawn_audio_capture,
@@ -68,12 +68,47 @@ impl SoundServerFactory for WrdpSoundFactory {
     }
 }
 
+/// Serializes producer sends with connection teardown. The lock covers only
+/// a nonblocking queue send; it never covers PipeWire or server state.
+#[derive(Debug)]
+struct AudioForwarding {
+    active: std::sync::Mutex<bool>,
+}
+
+impl AudioForwarding {
+    fn new() -> Self {
+        Self {
+            active: std::sync::Mutex::new(true),
+        }
+    }
+
+    fn stop(&self) {
+        *self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+    }
+
+    fn send(
+        &self,
+        sender: &mpsc::UnboundedSender<ServerEvent>,
+        message: RdpsndServerMessage,
+    ) -> bool {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active && sender.send(ServerEvent::Rdpsnd(message)).is_ok()
+    }
+}
+
 struct PipeWireRdpsndHandler {
     target: AudioTarget,
     event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
     formats: Vec<AudioFormat>,
     stop_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
     forward_task: Option<tokio::task::JoinHandle<()>>,
+    forwarding: Option<Arc<AudioForwarding>>,
 }
 
 impl std::fmt::Debug for PipeWireRdpsndHandler {
@@ -93,10 +128,16 @@ impl PipeWireRdpsndHandler {
             formats: vec![pcm_format()],
             stop_signal: None,
             forward_task: None,
+            forwarding: None,
         }
     }
 
     fn stop_capture(&mut self) {
+        // Disable sends first. When this returns, a producer that runs after
+        // task abort cannot enqueue audio for a later RDP connection.
+        if let Some(forwarding) = self.forwarding.take() {
+            forwarding.stop();
+        }
         if let Some(signal) = self.stop_signal.take() {
             signal.store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -165,6 +206,8 @@ impl RdpsndServerHandler for PipeWireRdpsndHandler {
             Box::new(std::io::Error::other(error.to_string())) as Box<dyn RdpsndError>
         })?;
         self.stop_signal = Some(capture.stop_signal());
+        let forwarding = Arc::new(AudioForwarding::new());
+        self.forwarding = Some(Arc::clone(&forwarding));
         self.forward_task = Some(tokio::spawn(async move {
             let started = Instant::now();
             while let Some(samples) = capture.receiver.recv().await {
@@ -180,33 +223,23 @@ impl RdpsndServerHandler for PipeWireRdpsndHandler {
                     continue;
                 }
                 let timestamp = started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
-                if event_sender
-                    .send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(
-                        pcm, timestamp,
-                    )))
-                    .is_err()
-                {
-                    debug!("RDPSND event channel closed; stopping PipeWire audio forwarding");
+                if !forwarding.send(&event_sender, RdpsndServerMessage::Wave(pcm, timestamp)) {
+                    debug!("RDPSND forwarding stopped or event channel closed");
                     capture.stop();
                     return;
                 }
             }
             warn!("PipeWire audio capture ended");
-            let _ = event_sender.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Close));
+            let _ = forwarding.send(&event_sender, RdpsndServerMessage::Close);
         }));
         info!(runtime = %runtime_dir.display(), "PipeWire RDPSND PCM capture requested");
         Ok(())
     }
 
     fn stop(&mut self) {
+        // IronRDP writes SNDC_CLOSE on the active connection before its
+        // transport closes. A queued Close here could reach the next client.
         self.stop_capture();
-        if let Some(sender) = &self.event_sender
-            && sender
-                .send(ServerEvent::Rdpsnd(RdpsndServerMessage::Close))
-                .is_err()
-        {
-            error!("Failed to queue RDPSND close event");
-        }
     }
 }
 
@@ -244,5 +277,54 @@ mod tests {
         assert_eq!(format.bits_per_sample, 16);
         assert_eq!(format.n_block_align, 4);
         assert_eq!(format.n_avg_bytes_per_sec, 192_000);
+    }
+
+    #[test]
+    fn stopping_backend_rejects_late_waves_and_close_for_next_connection() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let forwarding = Arc::new(AudioForwarding::new());
+        let mut handler = PipeWireRdpsndHandler::new(AudioTarget::default(), Some(sender.clone()));
+        handler.stop_signal = Some(signal.clone());
+        handler.forwarding = Some(Arc::clone(&forwarding));
+
+        handler.stop();
+        assert!(signal.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!forwarding.send(&sender, RdpsndServerMessage::Wave(vec![0; 4], 10)));
+        assert!(!forwarding.send(&sender, RdpsndServerMessage::Close));
+        drop(handler);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stopping_backend_aborts_forwarding_without_waiting_for_capture_thread() {
+        struct OnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let (started_sender, started) = tokio::sync::oneshot::channel();
+        let (dropped_sender, dropped) = tokio::sync::oneshot::channel();
+        let mut handler = PipeWireRdpsndHandler::new(AudioTarget::default(), None);
+        handler.forward_task = Some(tokio::spawn(async move {
+            let _guard = OnDrop(Some(dropped_sender));
+            let _ = started_sender.send(());
+            std::future::pending::<()>().await;
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(1), started)
+            .await
+            .expect("forwarder starts")
+            .expect("started signal");
+        handler.stop();
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped)
+            .await
+            .expect("forwarder is cancelled")
+            .expect("dropped signal");
     }
 }

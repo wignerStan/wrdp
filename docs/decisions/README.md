@@ -15,3 +15,4 @@
 | [0011](0011-own-session-audio.md) | Own audio in the managed desktop session | accepted |
 | [0012](0012-match-h264-driver-and-wire-headers.md) | Match H.264 packed driver headers, negotiated codec, and exclusive region bounds | accepted |
 | [0013](0013-enforce-hardware-fallback-policy.md) | Enforce the hardware fallback flag and negotiated codec on graphics recovery | accepted |
+| [0014](0014-encode-avc444-as-one-picture-sequence.md) | Encode both AVC444 views as one continuous, correctly budgeted H.264 sequence | accepted |

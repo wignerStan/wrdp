@@ -258,11 +258,14 @@ impl Avc444Encoder {
         });
         let color_matrix = color_space.matrix;
 
-        // Calculate appropriate H.264 level if dimensions provided
+        // Both views share one H.264 sequence. Rate control and Annex A level
+        // limits must cover two coded pictures per desktop frame, even when
+        // unchanged auxiliary views are later omitted.
+        let coded_fps = config.max_fps * 2.0;
         let level = config
             .width
             .zip(config.height)
-            .map(|(w, h)| H264Level::for_config(w, h, config.max_fps));
+            .map(|(w, h)| H264Level::for_config(w, h, coded_fps));
 
         // Build VuiConfig from ColorSpaceConfig for H.264 SPS signaling
         let vui = match (color_space.matrix, color_space.range) {
@@ -276,10 +279,13 @@ impl Avc444Encoder {
         use ::openh264::encoder::{
             BitRate, Complexity, EncoderConfig as UpstreamConfig, FrameRate, UsageType,
         };
+        // OpenH264 2.6 forces scene-change detection on in screen mode,
+        // even when requested off. Alternating packed views then become new
+        // scenes. Camera mode permits one continuous main/aux sequence.
         let mut compat_config = UpstreamConfig::new()
             .bitrate(BitRate::from_bps(config.bitrate_kbps * 1000))
-            .max_frame_rate(FrameRate::from_hz(config.max_fps))
-            .usage_type(UsageType::ScreenContentRealTime)
+            .max_frame_rate(FrameRate::from_hz(coded_fps))
+            .usage_type(UsageType::CameraVideoRealTime)
             .skip_frames(config.enable_skip_frame)
             .complexity(Complexity::High)
             .scene_change_detect(false)
@@ -579,17 +585,21 @@ impl Avc444Encoder {
         // - Next aux P-frame would reference missing frame → corruption
         // - By not encoding: Both DPBs stay perfectly in sync
 
-        let should_send_aux = self.should_send_aux(&aux_yuv420, main_is_keyframe); // Now OK - no mutable borrow
+        // A skipped main picture cannot be submitted as a complete desktop
+        // update. Do not advance the shared encoder with an auxiliary picture
+        // that the client will never receive.
+        if stream1_data.is_empty() {
+            trace!("AVC444 encoder skipped frame (main stream empty)");
+            return Ok(None);
+        }
+
+        let should_send_aux = self.should_send_aux(&aux_yuv420);
 
         let aux_bitstream_opt = if should_send_aux {
-            // === CRITICAL: Force aux IDR when main is IDR (artifact clearing sync) ===
-            // When periodic IDR or PLI triggers, both streams need full refresh.
-            // If main is IDR but aux is P-frame, the aux P-frame references may be stale.
-            // This ensures BOTH streams refresh together for complete artifact clearing.
-            if main_is_keyframe {
-                self.encoder.force_intra_frame(); // Same encoder!
-                debug!("Forcing aux IDR to sync with main IDR (artifact clearing)");
-            } else if self.force_aux_idr_on_return && self.frames_since_aux > 0 {
+            // The main IDR already resets the shared decoded-picture buffer.
+            // Its following auxiliary picture may safely reference that main
+            // picture. A second IDR is not needed to remove stale references.
+            if !main_is_keyframe && self.force_aux_idr_on_return && self.frames_since_aux > 0 {
                 // === SAFE MODE: Force aux IDR when reintroducing after omission ===
                 // If aux was omitted for N frames, forcing IDR when it returns ensures:
                 // - No dependency on stale aux frames decoder might have evicted
@@ -641,29 +651,14 @@ impl Avc444Encoder {
             .and_then(|d| d.checked_sub(pack_time))
             .unwrap_or_default();
 
-        let stream2_data_opt = aux_bitstream_opt.as_ref().map(|(data, _)| data.clone());
-
-        // Handle empty main bitstream (encoder skip)
-        if stream1_data.is_empty() {
-            trace!("AVC444 encoder skipped frame (main stream empty)");
-            return Ok(None);
-        }
-
-        // Check aux frame type (if encoded)
-        let _aux_is_keyframe = aux_bitstream_opt
-            .as_ref()
-            .is_some_and(|(_, keyframe)| *keyframe);
+        let (stream2_data_opt, aux_is_keyframe) = match aux_bitstream_opt {
+            Some((data, keyframe)) => (Some(data), keyframe),
+            None => (None, false),
+        };
 
         // Diagnostic logging for bandwidth analysis
         if let Some(ref aux_data) = stream2_data_opt {
-            let aux_type_str = if aux_bitstream_opt
-                .as_ref()
-                .is_some_and(|(_, keyframe)| *keyframe)
-            {
-                "IDR"
-            } else {
-                "P"
-            };
+            let aux_type_str = if aux_is_keyframe { "IDR" } else { "P" };
             debug!(
                 "[AVC444 Frame #{}] Main: {} ({}B), Aux: {} ({}B) [BOTH SENT]",
                 self.frame_count,
@@ -686,11 +681,9 @@ impl Avc444Encoder {
         // Windows MFT decoder always has parameter context.
         stream1_data = self.handle_sps_pps(stream1_data, main_is_keyframe);
 
-        // Aux stream keeps its own SPS/PPS intact. Per ITU-H.264 Annex B, each
-        // independently decoded bitstream needs SPS/PPS preceding IDR slices.
-        // OpenH264 can produce different SPS parameter
-        // bytes between sequential encode calls even with CONSTANT_ID strategy,
-        // so stripping aux SPS/PPS and relying on main's parameters is unsafe.
+        // Retain any parameter sets supplied by the auxiliary encode. The
+        // two views form one decoder sequence (MS-RDPEGFX 2.2.4.5), and their
+        // Annex B parameter sets must remain in their original order.
 
         // Update statistics
         self.frame_count += 1;
@@ -823,13 +816,9 @@ impl Avc444Encoder {
         }
     }
 
-    /// Force next frame to be a keyframe (IDR) in both subframes
-    ///
-    /// With single encoder, this affects the next encode() call.
-    /// Since we encode Main first, then Aux, this will make both IDR.
+    /// Refresh both views after a main IDR resets the shared decoder state.
     pub fn force_keyframe(&mut self) {
-        self.encoder.force_intra_frame();
-        debug!("Forced keyframe for next encode (affects both Main and Aux)");
+        self.request_idr();
     }
 
     /// Hash all encoded auxiliary planes for exact change detection.
@@ -850,41 +839,13 @@ impl Avc444Encoder {
         hash
     }
 
-    /// Determine if auxiliary stream should be encoded and sent
+    /// Send the first auxiliary view, changed content, interval refreshes,
+    /// and explicit full-frame recovery requests. If omitted, do not advance
+    /// the shared encoder with a picture that the client will never receive.
     ///
-    /// Implements hash-based change detection with configurable thresholds.
-    ///
-    /// # Decision Logic
-    ///
-    /// Aux is sent when ANY of these conditions are true:
-    /// 1. **Omission disabled** - always send (backward compatible)
-    /// 2. **First aux frame** - initial frame always sent
-    /// 3. **Forced refresh** - exceeded max_aux_interval
-    /// 4. **Content changed** - hash differs from cached aux
-    ///
-    /// # CRITICAL: Main IDR does NOT trigger aux send!
-    ///
-    /// Previously, we sent aux whenever main was IDR ("sync required"). This
-    /// created a FEEDBACK LOOP that prevented P-frames:
-    ///
-    /// 1. Main IDR → send aux → DPB contains Aux
-    /// 2. Next Main references Aux (different content) → forced IDR
-    /// 3. Main IDR → send aux → DPB contains Aux
-    /// 4. ... loop continues indefinitely
-    ///
-    /// By NOT sending aux on Main IDR, we break this loop:
-    /// 1. Aux refresh (max_interval) → Main becomes IDR (unavoidable)
-    /// 2. Next Main: we DON'T send aux → DPB = Main
-    /// 3. Next Main: references Main → P-frame works!
-    ///
-    /// The client handles Main IDR + cached aux correctly (LC=1 mode).
-    fn should_send_aux(
-        &mut self, // Changed to &mut self to clear force flag
-        aux_frame: &yuv444_packing::Yuv420Frame,
-        _main_is_keyframe: bool, // IGNORED: See feedback loop documentation above
-    ) -> bool {
-        // REMOVED: "main_is_keyframe → send aux" rule
-        // This was causing a feedback loop that prevented ALL P-frames!
+    /// A spontaneous main IDR does not require new auxiliary content. Explicit
+    /// and periodic IDR requests set force_aux_on_next_frame for full recovery.
+    fn should_send_aux(&mut self, aux_frame: &yuv444_packing::Yuv420Frame) -> bool {
         let decision = precheck_aux_stream_policy(
             self.force_aux_on_next_frame,
             self.enable_aux_omission,
@@ -1361,7 +1322,7 @@ mod tests {
     #[cfg(feature = "h264")]
     #[test]
     fn test_encoder_level() {
-        // 1080p should get an appropriate H.264 level
+        // 1080p at 30 desktop fps is a 60-picture/s decoder sequence.
         let config = EncoderConfig {
             width: Some(1920),
             height: Some(1080),
@@ -1369,7 +1330,74 @@ mod tests {
             ..Default::default()
         };
         let encoder = require_openh264!(Avc444Encoder::new(config));
-        assert!(encoder.level().is_some());
+        assert_eq!(encoder.level(), Some(H264Level::L4_2));
+    }
+
+    #[cfg(feature = "h264")]
+    #[test]
+    fn shared_encoder_uses_dual_picture_level_and_main_idr_reference() {
+        for (width, height, level) in [(1280, 800, H264Level::L4_0), (1712, 1056, H264Level::L4_2)]
+        {
+            let config = EncoderConfig {
+                width: Some(width),
+                height: Some(height),
+                max_fps: 30.0,
+                enable_skip_frame: false,
+                ..Default::default()
+            };
+            let mut encoder = require_openh264!(Avc444Encoder::new(config));
+            encoder.configure_aux_omission(false, 30, false);
+            encoder.configure_periodic_idr(0);
+            let pixels = vec![100; usize::from(width) * usize::from(height) * 4];
+            let frame = encoder
+                .encode_bgra(&pixels, u32::from(width), u32::from(height), 0)
+                .unwrap()
+                .unwrap();
+            assert_eq!(encoder.level(), Some(level));
+            let nals = |data: &[u8]| {
+                data.windows(5)
+                    .filter(|v| v[..4] == [0, 0, 0, 1])
+                    .map(|v| v[4] & 0x1f)
+                    .collect::<Vec<_>>()
+            };
+            assert!(nals(&frame.stream1_data).contains(&5));
+            let aux = frame.stream2_data.as_ref().unwrap();
+            assert!(nals(aux).contains(&1), "aux NALs: {:?}", nals(aux));
+            assert!(!nals(aux).contains(&5));
+            // The actual SPS level_idc must match the dual-picture budget.
+            let sps = frame
+                .stream1_data
+                .windows(8)
+                .find(|v| v[..5] == [0, 0, 0, 1, 0x67])
+                .unwrap();
+            assert_eq!(sps[7], level as u8);
+        }
+    }
+
+    #[cfg(feature = "h264")]
+    #[test]
+    fn auxiliary_return_and_full_recovery_keep_one_decoder_sequence() {
+        let config = EncoderConfig {
+            width: Some(64),
+            height: Some(64),
+            enable_skip_frame: false,
+            ..Default::default()
+        };
+        let mut encoder = require_openh264!(Avc444Encoder::new(config));
+        encoder.configure_aux_omission(true, 1, false);
+        encoder.configure_periodic_idr(0);
+        let pixels = vec![100; 64 * 64 * 4];
+        let first = encoder.encode_bgra(&pixels, 64, 64, 0).unwrap().unwrap();
+        assert!(first.stream2_data.is_some());
+        let omitted = encoder.encode_bgra(&pixels, 64, 64, 33).unwrap().unwrap();
+        assert!(omitted.stream2_data.is_none());
+        let returned = encoder.encode_bgra(&pixels, 64, 64, 66).unwrap().unwrap();
+        assert!(!returned.is_keyframe);
+        assert!(returned.stream2_data.is_some());
+        encoder.force_keyframe();
+        let recovered = encoder.encode_bgra(&pixels, 64, 64, 99).unwrap().unwrap();
+        assert!(recovered.is_keyframe);
+        assert!(recovered.stream2_data.is_some());
     }
 
     #[cfg(feature = "h264")]

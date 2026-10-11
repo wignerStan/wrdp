@@ -19,7 +19,7 @@ use crate::rdp::channels::graphics::egfx::{
     color::{
         convert::bgra_to_yuv444,
         space::ColorRange,
-        yuv444_packing::{self, pack_dual_views},
+        yuv444_packing::pack_dual_views,
     },
     h264::encoder,
 };

@@ -1,10 +1,10 @@
 //! AVC444 encoder for EGFX runtime paths.
 //!
 //! Encodes BGRA frames into main/aux H.264 streams, keeps stream state aligned
-//! across omission decisions, and exposes timing/stats for runtime diagnostics.
+//! across paired updates, and exposes timing/stats for runtime diagnostics.
 
 #[cfg(feature = "h264")]
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use crate::rdp::channels::graphics::egfx::{
     color::{convert::ColorMatrix, space::ColorSpaceConfig},
@@ -26,13 +26,9 @@ use crate::rdp::channels::graphics::egfx::{
 
 /// AVC444 encoded frame (dual H.264 bitstreams)
 ///
-/// # Phase 1: Auxiliary Stream Omission
-///
-/// The `stream2_data` field is now Optional to support bandwidth optimization.
-/// When `None`, the MS-RDPEGFX LC field is set to 1 (luma only), instructing
-/// the client to reuse its previously cached auxiliary stream.
-///
-/// This follows the runtime omission strategy used by this pipeline.
+/// Every full-frame main update is followed by an auxiliary update. MS-RDPEGFX
+/// 3.3.8.3.2 converts received main regions as YUV420; cached auxiliary data alone
+/// does not preserve YUV444 color after another main update.
 #[derive(Debug)]
 pub struct Avc444Frame {
     /// Main view bitstream (full luma + subsampled chroma)
@@ -40,19 +36,10 @@ pub struct Avc444Frame {
     /// Always present - contains primary visual information
     pub stream1_data: Vec<u8>,
 
-    /// Auxiliary view bitstream (additional chroma data)
+    /// Auxiliary view bitstream (additional chroma data).
     ///
-    /// **Phase 1: Now Optional for bandwidth optimization**
-    ///
-    /// - `Some(data)`: Auxiliary stream present (LC=0 or LC=2)
-    /// - `None`: Auxiliary stream omitted (LC=1, client reuses cached auxiliary data)
-    ///
-    /// When `None`, client decoder:
-    /// 1. Decodes main stream normally
-    /// 2. Retrieves cached auxiliary data
-    /// 3. Combines to reconstruct YUV444
-    ///
-    /// Expected omission rate: 60-90% of frames (depending on content)
+    /// The encoder produces `Some(data)` for every submitted full-frame update.
+    /// `None` represents a main-only LC 1 update and has YUV420 color fidelity.
     pub stream2_data: Option<Vec<u8>>,
 
     /// Whether this is a keyframe (IDR) in main stream
@@ -116,46 +103,6 @@ pub struct Avc444Stats {
 ///     // Send frame.stream1_data and frame.stream2_data via EGFX
 /// }
 /// ```
-#[cfg(any(feature = "h264", test))]
-const MIN_AUX_INTERVAL: u32 = 10;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(any(feature = "h264", test))]
-enum AuxStreamPrecheck {
-    SendForced,
-    SendOmissionDisabled,
-    SendFirstFrame,
-    SendMaxInterval,
-    SkipRateLimited,
-    CompareContentHash,
-}
-
-#[cfg(any(feature = "h264", test))]
-fn precheck_aux_stream_policy(
-    force_aux: bool,
-    omission_enabled: bool,
-    has_previous_aux: bool,
-    frames_since_aux: u32,
-    max_aux_interval: u32,
-) -> AuxStreamPrecheck {
-    if force_aux {
-        return AuxStreamPrecheck::SendForced;
-    }
-    if !omission_enabled {
-        return AuxStreamPrecheck::SendOmissionDisabled;
-    }
-    if !has_previous_aux {
-        return AuxStreamPrecheck::SendFirstFrame;
-    }
-    if frames_since_aux >= max_aux_interval {
-        return AuxStreamPrecheck::SendMaxInterval;
-    }
-    if frames_since_aux < MIN_AUX_INTERVAL {
-        return AuxStreamPrecheck::SkipRateLimited;
-    }
-    AuxStreamPrecheck::CompareContentHash
-}
-
 #[cfg(feature = "h264")]
 pub struct Avc444Encoder {
     /// SINGLE H.264 encoder for BOTH Main and Aux subframes
@@ -196,35 +143,6 @@ pub struct Avc444Encoder {
     /// Set to true to diagnose P-frame specific color issues
     force_all_keyframes: bool,
 
-    // === PHASE 1: AUX OMISSION (BANDWIDTH OPTIMIZATION) ===
-    /// Hash of last encoded auxiliary frame for change detection
-    /// None = no aux encoded yet or omission disabled
-    last_aux_hash: Option<u64>,
-
-    /// Number of frames since last auxiliary update
-    /// Used to enforce max_aux_interval refresh policy
-    frames_since_aux: u32,
-
-    /// Maximum frames between auxiliary updates (forced refresh)
-    /// Default: 30 frames (1 second @ 30fps)
-    /// Range: 1-120 frames
-    /// - Lower (10-20): Higher quality, more bandwidth, responsive to color changes
-    /// - Medium (30-40): Balanced, recommended for most content
-    /// - Higher (60-120): Lower bandwidth, acceptable for static/slow-changing content
-    max_aux_interval: u32,
-
-    /// Force auxiliary stream to IDR when reintroducing after omission
-    /// Default: true (safe mode - prevents aux P-frames from referencing stale frames)
-    /// - true: Always IDR when aux returns (robust, recommended)
-    /// - false: Allow aux P-frames (experimental, may reduce quality)
-    force_aux_idr_on_return: bool,
-
-    /// Enable auxiliary stream omission (LC field optimization)
-    /// Default: false initially (for gradual rollout)
-    /// When true: implements FreeRDP-proven bandwidth optimization
-    /// When false: always sends both streams (current all-I behavior)
-    enable_aux_omission: bool,
-
     // === PERIODIC IDR (ARTIFACT RECOVERY) ===
     /// Time of last IDR keyframe (for periodic forced IDR)
     last_idr_time: std::time::Instant,
@@ -236,10 +154,6 @@ pub struct Avc444Encoder {
 
     /// Flag to force next frame as IDR (set by client PLI or periodic timer)
     force_next_idr: bool,
-
-    /// Flag to force aux inclusion on next frame (set when periodic IDR fires)
-    /// This bypasses aux omission to ensure BOTH streams refresh together
-    force_aux_on_next_frame: bool,
 }
 
 #[cfg(feature = "h264")]
@@ -259,8 +173,7 @@ impl Avc444Encoder {
         let color_matrix = color_space.matrix;
 
         // Both views share one H.264 sequence. Rate control and Annex A level
-        // limits must cover two coded pictures per desktop frame, even when
-        // unchanged auxiliary views are later omitted.
+        // limits must cover two coded pictures per desktop frame.
         let coded_fps = config.max_fps * 2.0;
         let level = config
             .width
@@ -286,7 +199,9 @@ impl Avc444Encoder {
             .bitrate(BitRate::from_bps(config.bitrate_kbps * 1000))
             .max_frame_rate(FrameRate::from_hz(coded_fps))
             .usage_type(UsageType::CameraVideoRealTime)
-            .skip_frames(config.enable_skip_frame)
+            // Per-picture skips could drop auxiliary while submitting main,
+            // which downgrades its full-frame region to YUV420 color.
+            .skip_frames(false)
             .complexity(Complexity::High)
             .scene_change_detect(false)
             .vui(vui);
@@ -333,19 +248,10 @@ impl Avc444Encoder {
             current_level: level,
             // DIAGNOSTIC FLAG: Force all keyframes to disable P-frame inter-prediction
             force_all_keyframes: false, // Re-enabled P-frames with temporal logging
-            // Phase 1: Aux omission defaults
-            // NOTE: These are now overridden by configure_aux_omission() called from display_handler
-            // using wrdp.ini values
-            last_aux_hash: None,
-            frames_since_aux: 0,
-            max_aux_interval: 30,           // Default, overridden by config
-            force_aux_idr_on_return: false, // Default, overridden by config
-            enable_aux_omission: false,     // Default, overridden by config
             // Periodic IDR defaults (overridden by configure_periodic_idr)
             last_idr_time: std::time::Instant::now(),
             periodic_idr_interval_secs: 5, // Default 5 seconds
             force_next_idr: false,
-            force_aux_on_next_frame: false,
         })
     }
 
@@ -368,36 +274,19 @@ impl Avc444Encoder {
         Self::new(config)
     }
 
-    /// Configure Phase 1 auxiliary omission parameters
+    /// Accept legacy auxiliary-omission configuration without reducing color fidelity.
     ///
-    /// Call this after `new()` to apply configuration from EgfxConfig.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let mut encoder = Avc444Encoder::new(config)?;
-    /// encoder.configure_aux_omission(true, 30, true);
-    /// ```
+    /// Full-frame main regions overwrite color using YUV420 (MS-RDPEGFX
+    /// 3.3.8.3.2). The encoder must therefore send auxiliary on every update.
+    /// Omission needs region-aware main masks before it can be enabled safely.
     pub fn configure_aux_omission(
         &mut self,
         enable: bool,
-        max_interval: u32,
-        force_idr_on_return: bool,
+        _max_interval: u32,
+        _force_idr_on_return: bool,
     ) {
-        self.enable_aux_omission = enable;
-        self.max_aux_interval = max_interval.clamp(1, 120);
-        self.force_aux_idr_on_return = force_idr_on_return;
-
-        debug!(
-            "AVC444 aux omission configured: enabled={}, max_interval={}, force_idr={}",
-            enable, self.max_aux_interval, force_idr_on_return
-        );
-
         if enable {
-            info!(
-                "🎬 Phase 1 AUX OMISSION ENABLED: max_interval={}frames, force_idr_on_return={}",
-                self.max_aux_interval, force_idr_on_return
-            );
+            warn!("AVC444 auxiliary omission ignored: full-frame main updates require auxiliary");
         }
     }
 
@@ -453,17 +342,11 @@ impl Avc444Encoder {
         false
     }
 
-    /// Check if we should force an IDR frame due to periodic interval or PLI
-    ///
-    /// When this returns true, it also sets `force_aux_on_next_frame` to ensure
-    /// BOTH streams (Main + Aux) get refreshed. This is critical for clearing
-    /// artifacts - if we only IDR the Main stream while omitting Aux, the client
-    /// reuses its cached aux which may contain artifacts.
+    /// Check if the shared main/aux sequence needs an IDR due to the timer or PLI.
     fn should_force_idr(&mut self) -> bool {
         // Check PLI request first
         if self.force_next_idr {
             self.force_next_idr = false;
-            self.force_aux_on_next_frame = true; // Force aux to clear ALL artifacts
             self.last_idr_time = std::time::Instant::now();
             info!("Forcing IDR (client PLI request) - both Main and Aux will refresh");
             return true;
@@ -474,7 +357,6 @@ impl Avc444Encoder {
             let elapsed = self.last_idr_time.elapsed();
             if elapsed >= std::time::Duration::from_secs(self.periodic_idr_interval_secs as u64) {
                 self.last_idr_time = std::time::Instant::now();
-                self.force_aux_on_next_frame = true; // Force aux to clear ALL artifacts
                 info!(
                     "Forcing periodic IDR ({}s elapsed) - BOTH Main and Aux will refresh to clear artifacts",
                     elapsed.as_secs()
@@ -568,23 +450,9 @@ impl Avc444Encoder {
         // EncodedBitStream borrows the encoder; copy before the second encode.
         let mut stream1_data = main_encoded.to_vec();
 
-        // === PHASE 1: AUXILIARY STREAM (CONDITIONALLY ENCODED) ===
-        //
-        // CRITICAL IMPLEMENTATION: "Don't encode what you don't send"
-        //
-        // This is the runtime bandwidth optimization pattern.
-        // If aux hasn't changed, we:
-        // 1. Don't encode it at all (skip encoder call entirely)
-        // 2. Send LC=1 (luma only) to client
-        // 3. Client reuses previous aux from its cache
-        //
-        // This keeps encoder and decoder DPB timelines synchronized!
-        //
-        // Why this matters:
-        // - If we encoded but didn't send: Encoder DPB contains frame decoder never saw
-        // - Next aux P-frame would reference missing frame → corruption
-        // - By not encoding: Both DPBs stay perfectly in sync
-
+        // Main regions cover the full frame. Each main update is converted as
+        // YUV420 by the client, so auxiliary must follow even if it is unchanged.
+        // Encode and submit both pictures in the same shared decoder sequence.
         // A skipped main picture cannot be submitted as a complete desktop
         // update. Do not advance the shared encoder with an auxiliary picture
         // that the client will never receive.
@@ -593,57 +461,30 @@ impl Avc444Encoder {
             return Ok(None);
         }
 
-        let should_send_aux = self.should_send_aux(&aux_yuv420);
-
-        let aux_bitstream_opt = if should_send_aux {
-            // The main IDR already resets the shared decoded-picture buffer.
-            // Its following auxiliary picture may safely reference that main
-            // picture. A second IDR is not needed to remove stale references.
-            if !main_is_keyframe && self.force_aux_idr_on_return && self.frames_since_aux > 0 {
-                // === SAFE MODE: Force aux IDR when reintroducing after omission ===
-                // If aux was omitted for N frames, forcing IDR when it returns ensures:
-                // - No dependency on stale aux frames decoder might have evicted
-                // - Clean reference point for future aux updates
-                // - Robust operation even with long omission intervals
-                self.encoder.force_intra_frame(); // Same encoder!
-                debug!(
-                    "Forcing aux IDR on reintroduction (omitted for {} frames)",
-                    self.frames_since_aux
-                );
-            }
-
-            // Encode Aux subframe SECOND with SAME encoder (sequential call)
-            // CRITICAL: This maintains unified DPB shared with Main
-            let aux_encoded = self
-                .encoder
-                .encode_at(
-                    &aux_yuv420,
-                    ::openh264::Timestamp::from_millis(timestamp_ms),
-                )
-                .map_err(|e| {
-                    EncoderError::EncodeFailed(format!("Aux subframe encoding failed: {e}"))
-                })?;
-            let aux_is_keyframe = matches!(
-                aux_encoded.frame_type(),
-                ::openh264::encoder::FrameType::IDR | ::openh264::encoder::FrameType::I
-            );
-            let aux_data = aux_encoded.to_vec();
-            if aux_data.is_empty() {
-                trace!("Aux encoder skipped frame (rate control) - treating as omitted");
-                self.frames_since_aux += 1;
-                None
-            } else {
-                self.last_aux_hash = Some(Self::hash_yuv420(&aux_yuv420));
-                self.frames_since_aux = 0;
-                Some((aux_data, aux_is_keyframe))
-            }
-        } else {
-            // === AUX OMITTED: Don't encode at all! ===
-            // This keeps DPB synchronized with decoder
-            // Client will reuse previous aux (LC=1 behavior)
-            self.frames_since_aux += 1;
-            None
-        };
+        // The main IDR resets the shared decoded-picture buffer. The following
+        // auxiliary picture can reference that main without another IDR.
+        let aux_encoded = self
+            .encoder
+            .encode_at(
+                &aux_yuv420,
+                ::openh264::Timestamp::from_millis(timestamp_ms),
+            )
+            .map_err(|e| {
+                EncoderError::EncodeFailed(format!("Aux subframe encoding failed: {e}"))
+            })?;
+        let aux_is_keyframe = matches!(
+            aux_encoded.frame_type(),
+            ::openh264::encoder::FrameType::IDR | ::openh264::encoder::FrameType::I
+        );
+        let aux_data = aux_encoded.to_vec();
+        if aux_data.is_empty() {
+            // The shared encoder has already advanced past the unsent main.
+            // Suppress this incomplete update and reset its references before retry.
+            self.request_idr();
+            warn!("AVC444 auxiliary picture empty; requesting a complete IDR update");
+            return Ok(None);
+        }
+        let aux_bitstream_opt = Some((aux_data, aux_is_keyframe));
 
         let encode_time = start
             .elapsed()
@@ -821,88 +662,6 @@ impl Avc444Encoder {
         self.request_idr();
     }
 
-    /// Hash all encoded auxiliary planes for exact change detection.
-    ///
-    /// Sampling only luma can miss both unsampled luma changes and chroma-only
-    /// updates, leaving the client reusing stale auxiliary data.
-    fn hash_yuv420(frame: &yuv444_packing::Yuv420Frame) -> u64 {
-        let mut hash = 0xcbf29ce484222325u64;
-        for byte in frame
-            .y_plane()
-            .iter()
-            .chain(frame.u_plane())
-            .chain(frame.v_plane())
-        {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash
-    }
-
-    /// Send the first auxiliary view, changed content, interval refreshes,
-    /// and explicit full-frame recovery requests. If omitted, do not advance
-    /// the shared encoder with a picture that the client will never receive.
-    ///
-    /// A spontaneous main IDR does not require new auxiliary content. Explicit
-    /// and periodic IDR requests set force_aux_on_next_frame for full recovery.
-    fn should_send_aux(&mut self, aux_frame: &yuv444_packing::Yuv420Frame) -> bool {
-        let decision = precheck_aux_stream_policy(
-            self.force_aux_on_next_frame,
-            self.enable_aux_omission,
-            self.last_aux_hash.is_some(),
-            self.frames_since_aux,
-            self.max_aux_interval,
-        );
-
-        match decision {
-            AuxStreamPrecheck::SendForced => {
-                // CRITICAL: Forced aux for artifact clearing (periodic IDR or PLI)
-                // This bypasses ALL omission logic to ensure client gets fresh aux stream
-                self.force_aux_on_next_frame = false; // Consume the flag
-                info!("Sending aux: FORCED for artifact clearing (bypassing omission)");
-                true
-            }
-            AuxStreamPrecheck::SendOmissionDisabled => true,
-            AuxStreamPrecheck::SendFirstFrame => {
-                trace!("Sending aux: first frame");
-                true
-            }
-            AuxStreamPrecheck::SendMaxInterval => {
-                debug!(
-                    "Sending aux: forced refresh ({} frames since last, max={})",
-                    self.frames_since_aux, self.max_aux_interval
-                );
-                true
-            }
-            AuxStreamPrecheck::SkipRateLimited => {
-                trace!(
-                    "Skipping aux: rate limited ({} frames since last, min={})",
-                    self.frames_since_aux, MIN_AUX_INTERVAL
-                );
-                false
-            }
-            AuxStreamPrecheck::CompareContentHash => {
-                // Compare all auxiliary planes; hash equality means the exact
-                // encoded input bytes are unchanged.
-                let current_hash = Self::hash_yuv420(aux_frame);
-                let changed = self
-                    .last_aux_hash
-                    .is_some_and(|previous_hash| current_hash != previous_hash);
-
-                if changed {
-                    trace!("Sending aux: content changed (hash mismatch)");
-                } else {
-                    trace!(
-                        "Skipping aux: no change detected (frame {} since last)",
-                        self.frames_since_aux
-                    );
-                }
-
-                changed
-            }
-        }
-    }
-
     pub fn stats(&self) -> Avc444Stats {
         Avc444Stats {
             frames_encoded: self.frame_count,
@@ -992,38 +751,6 @@ impl Avc444Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn aux_stream_policy_preserves_forced_and_disabled_cases() {
-        assert_eq!(
-            precheck_aux_stream_policy(true, true, true, 0, 30),
-            AuxStreamPrecheck::SendForced
-        );
-        assert_eq!(
-            precheck_aux_stream_policy(false, false, true, 0, 30),
-            AuxStreamPrecheck::SendOmissionDisabled
-        );
-    }
-
-    #[test]
-    fn aux_stream_policy_orders_first_interval_and_hash_checks() {
-        assert_eq!(
-            precheck_aux_stream_policy(false, true, false, 0, 30),
-            AuxStreamPrecheck::SendFirstFrame
-        );
-        assert_eq!(
-            precheck_aux_stream_policy(false, true, true, 30, 30),
-            AuxStreamPrecheck::SendMaxInterval
-        );
-        assert_eq!(
-            precheck_aux_stream_policy(false, true, true, MIN_AUX_INTERVAL - 1, 30),
-            AuxStreamPrecheck::SkipRateLimited
-        );
-        assert_eq!(
-            precheck_aux_stream_policy(false, true, true, MIN_AUX_INTERVAL, 30),
-            AuxStreamPrecheck::CompareContentHash
-        );
-    }
 
     /// Try to create an encoder, returning early if OpenH264 library is not installed.
     /// Tests that require the library call this instead of unwrap() so CI environments
@@ -1376,28 +1103,48 @@ mod tests {
 
     #[cfg(feature = "h264")]
     #[test]
-    fn auxiliary_return_and_full_recovery_keep_one_decoder_sequence() {
-        let config = EncoderConfig {
-            width: Some(64),
-            height: Some(64),
-            enable_skip_frame: false,
-            ..Default::default()
-        };
-        let mut encoder = require_openh264!(Avc444Encoder::new(config));
-        encoder.configure_aux_omission(true, 1, false);
-        encoder.configure_periodic_idr(0);
-        let pixels = vec![100; 64 * 64 * 4];
-        let first = encoder.encode_bgra(&pixels, 64, 64, 0).unwrap().unwrap();
-        assert!(first.stream2_data.is_some());
-        let omitted = encoder.encode_bgra(&pixels, 64, 64, 33).unwrap().unwrap();
-        assert!(omitted.stream2_data.is_none());
-        let returned = encoder.encode_bgra(&pixels, 64, 64, 66).unwrap().unwrap();
-        assert!(!returned.is_keyframe);
-        assert!(returned.stream2_data.is_some());
-        encoder.force_keyframe();
-        let recovered = encoder.encode_bgra(&pixels, 64, 64, 99).unwrap().unwrap();
-        assert!(recovered.is_keyframe);
-        assert!(recovered.stream2_data.is_some());
+    fn full_frame_updates_preserve_auxiliary_despite_legacy_omission_and_skip_settings() {
+        for enable_omission in [false, true] {
+            let config = EncoderConfig {
+                width: Some(64),
+                height: Some(64),
+                bitrate_kbps: 1,
+                enable_skip_frame: true,
+                ..Default::default()
+            };
+            let mut encoder = require_openh264!(Avc444Encoder::new(config));
+            encoder.configure_aux_omission(enable_omission, 120, true);
+            encoder.configure_periodic_idr(0);
+            // Red/blue stripes require the auxiliary view for full chroma.
+            let pixels: Vec<u8> = (0..64 * 64)
+                .flat_map(|pixel| {
+                    if pixel % 2 == 0 {
+                        [0, 0, 255, 255]
+                    } else {
+                        [255, 0, 0, 255]
+                    }
+                })
+                .collect();
+            for index in 0..6 {
+                if index == 3 {
+                    encoder.force_keyframe();
+                }
+                let frame = encoder
+                    .encode_bgra(&pixels, 64, 64, index * 33)
+                    .unwrap()
+                    .expect("complete main/aux update");
+                assert!(!frame.stream1_data.is_empty());
+                assert!(
+                    frame
+                        .stream2_data
+                        .as_ref()
+                        .is_some_and(|aux| !aux.is_empty())
+                );
+                if index == 0 || index == 3 {
+                    assert!(frame.is_keyframe);
+                }
+            }
+        }
     }
 
     #[cfg(feature = "h264")]

@@ -327,8 +327,8 @@ impl EgfxChannelSender {
     /// Auxiliary stream omission mode.
     ///
     /// The `stream2_data` parameter is now Optional. When `None`, IronRDP's
-    /// `send_avc444_frame` will set LC=1 (luma only), instructing the client
-    /// to reuse its cached auxiliary stream for bandwidth optimization.
+    /// `send_avc444_frame` will set LC=1 (main only). The updated main regions
+    /// then have YUV420 color until a subsequent auxiliary update restores YUV444.
     #[expect(
         clippy::too_many_arguments,
         reason = "dual-stream AVC444 + damage regions + geometry"

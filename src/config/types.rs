@@ -620,28 +620,17 @@ pub struct EgfxConfig {
     #[serde(default = "default_true")]
     pub avc444_enabled: bool,
 
-    // === PHASE 1: AUX OMISSION (BANDWIDTH OPTIMIZATION) ===
-    /// Enable auxiliary stream omission for bandwidth optimization
-    /// When true: Implements FreeRDP-style aux omission (LC field)
-    /// When false: Always sends both streams (backward compatible)
-    /// Default: true (production proven at 0.81 MB/s)
-    #[serde(default = "default_true")]
+    /// Legacy auxiliary-omission setting, accepted for configuration compatibility.
+    /// Full-frame AVC444 updates always send auxiliary to preserve YUV444 color.
+    /// Region-aware main masks are required before omission can be enabled safely.
+    #[serde(default = "default_false")]
     pub avc444_enable_aux_omission: bool,
 
-    /// Maximum frames between auxiliary updates (1-120)
-    /// Forces aux refresh even if unchanged for quality assurance
-    /// - 10-20: Responsive to color changes, higher bandwidth
-    /// - 30-40: Balanced (recommended)
-    /// - 60-120: Aggressive omission, static content optimized
-    ///
-    /// Default: 30 frames (1 second @ 30fps)
+    /// Legacy omission interval, accepted but unused by full-frame AVC444 updates.
     #[serde(default = "default_aux_interval")]
     pub avc444_max_aux_interval: u32,
 
-    /// Force auxiliary IDR when reintroducing after omission
-    /// true: Safe mode, but with single encoder forces Main to IDR too!
-    /// false: Required for single encoder to allow Main P-frames (PRODUCTION)
-    /// Default: false
+    /// Legacy omission recovery setting, accepted but unused by full-frame updates.
     #[serde(default = "default_false")]
     pub avc444_force_aux_idr_on_return: bool,
 }
@@ -693,8 +682,8 @@ impl Default for EgfxConfig {
             color_range: "auto".to_string(), // Use matrix default (limited for compatibility)
             avc444_enabled: true,          // Enable AVC444 when client supports it
             // Phase 1: Aux omission defaults (NOW PRODUCTION DEFAULTS)
-            avc444_enable_aux_omission: true, // Enabled by default (production proven)
-            avc444_max_aux_interval: 30,      // 1 second @ 30fps
+            avc444_enable_aux_omission: false, // Full-frame main updates require auxiliary
+            avc444_max_aux_interval: 30,       // 1 second @ 30fps
             avc444_force_aux_idr_on_return: false, // Must be false for single encoder
         }
     }

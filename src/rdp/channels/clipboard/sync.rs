@@ -4,9 +4,7 @@ pub use crate::rdp::channels::clipboard::core::loop_detector::ClipboardSource;
 pub use crate::rdp::channels::clipboard::core::{
     ClipboardFormat, LoopDetectionConfig, LoopDetector,
 };
-use std::time::{Duration, Instant};
-
-const ECHO_WINDOW: Duration = Duration::from_secs(2);
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncDirection {
@@ -68,9 +66,8 @@ impl SyncManager {
         &self.state
     }
     pub fn handle_rdp_formats(&mut self, formats: Vec<ClipboardFormat>) -> bool {
-        if self.detector.would_cause_loop(&formats) {
-            return false;
-        }
+        // A format list carries ownership, not a content identity. Consecutive
+        // copies commonly have the same formats and must still fetch new bytes.
         self.detector.record_formats(&formats, ClipboardSource::Rdp);
         self.detector.record_sync(ClipboardSource::Rdp);
         self.state = ClipboardState::RdpOwned(formats, Instant::now());
@@ -81,9 +78,7 @@ impl SyncManager {
         mime_types: Vec<String>,
         authoritative: bool,
     ) -> PortalSyncDecision {
-        if let ClipboardState::RdpOwned(_, since) = &self.state
-            && (!authoritative || since.elapsed() < ECHO_WINDOW)
-        {
+        if matches!(self.state, ClipboardState::RdpOwned(..)) && !authoritative {
             return PortalSyncDecision::Block;
         }
         if !authoritative && self.detector.would_cause_loop_mime(&mime_types) {
@@ -154,13 +149,38 @@ mod tests {
         assert!(matches!(s.state(), ClipboardState::RdpOwned(..)));
     }
     #[test]
-    fn immediate_local_echo_is_blocked() {
+    fn non_authoritative_local_echo_is_blocked() {
         let mut s = SyncManager::new();
         s.handle_rdp_formats(text());
         assert_eq!(
-            s.handle_portal_formats(vec!["text/plain".into()], true),
+            s.handle_portal_formats(vec!["text/plain".into()], false),
             PortalSyncDecision::Block
         );
+    }
+    #[test]
+    fn fast_authoritative_local_copy_replaces_remote_owner() {
+        let mut s = SyncManager::new();
+        assert!(s.handle_rdp_formats(text()));
+        assert_eq!(
+            s.handle_portal_formats(vec!["text/plain".into()], true),
+            PortalSyncDecision::Allow
+        );
+        assert_eq!(
+            s.state(),
+            &ClipboardState::PortalOwned(vec!["text/plain".into()])
+        );
+    }
+    #[test]
+    fn repeated_remote_formats_fetch_each_new_selection() {
+        let mut s = SyncManager::new();
+        assert!(s.handle_rdp_formats(text()));
+        assert_eq!(
+            s.handle_portal_formats(vec!["text/plain".into()], true),
+            PortalSyncDecision::Allow
+        );
+        assert!(s.handle_rdp_formats(text()));
+        assert!(s.handle_rdp_formats(text()));
+        assert!(matches!(s.state(), ClipboardState::RdpOwned(..)));
     }
     #[test]
     fn content_echo_is_blocked() {

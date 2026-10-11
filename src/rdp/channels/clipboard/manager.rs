@@ -97,6 +97,20 @@ impl Default for ClipboardOrchestratorConfig {
 /// Real compositor serials are sequential small numbers, so u32::MAX won't collide.
 const EAGER_FETCH_SERIAL: u32 = u32::MAX;
 
+fn upfront_rdp_format(
+    formats: &[ClipboardFormat],
+    enable_images: bool,
+) -> Option<(u32, &'static str)> {
+    use super::core::formats::{CF_DIB, CF_DIBV5, CF_UNICODETEXT};
+    [
+        (CF_UNICODETEXT, "text/plain"),
+        (CF_DIBV5, "image/png"),
+        (CF_DIB, "image/png"),
+    ]
+    .into_iter()
+    .find(|(id, _)| (*id == CF_UNICODETEXT || enable_images) && formats.iter().any(|f| f.id == *id))
+}
+
 /// Response callback for sending data back to RDP
 pub type RdpResponseCallback = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
 
@@ -808,7 +822,7 @@ impl ClipboardOrchestrator {
             ClipboardEvent::RdpFormatList(formats) => {
                 Self::handle_rdp_format_list(
                     formats,
-                    converter,
+                    config,
                     sync_manager,
                     clipboard_provider,
                     current_rdp_formats,
@@ -934,7 +948,7 @@ impl ClipboardOrchestrator {
     /// Handle RDP format list announcement
     async fn handle_rdp_format_list(
         formats: Vec<ClipboardFormat>,
-        _converter: &FormatConverter,
+        config: &ClipboardOrchestratorConfig,
         sync_manager: &Arc<RwLock<SyncManager>>,
         clipboard_provider: &SharedClipboardProvider,
         current_rdp_formats: &Arc<RwLock<Vec<ClipboardFormat>>>,
@@ -991,17 +1005,19 @@ impl ClipboardOrchestrator {
                     ClipboardError::PortalError(format!("Provider clear selection failed: {e}"))
                 })?;
 
-                let has_text = mime_types.iter().any(|m| m.starts_with("text/plain"));
-                let has_cf_unicodetext = formats.iter().any(|f| f.id == 13);
-
-                if has_text && has_cf_unicodetext {
-                    info!("Data-control provider: eagerly fetching CF_UNICODETEXT from RDP client");
+                if let Some((format_id, mime_type)) =
+                    upfront_rdp_format(&formats, config.enable_images)
+                {
+                    info!(
+                        format_id,
+                        mime_type, "Fetching RDP data before publishing its source"
+                    );
 
                     // Queue a sentinel entry so handle_rdp_data_response knows this is eager fetch.
                     // The response handler publishes the source only after caching the bytes.
                     pending_portal_requests.write().await.push_back((
                         EAGER_FETCH_SERIAL,
-                        "text/plain".to_string(),
+                        mime_type.to_string(),
                         std::time::Instant::now(),
                     ));
 
@@ -1010,9 +1026,9 @@ impl ClipboardOrchestrator {
                         use ironrdp_cliprdr::{backend::ClipboardMessage, pdu::ClipboardFormatId};
 
                         if let Err(e) = sender.send(ironrdp_server::ServerEvent::Clipboard(
-                            ClipboardMessage::SendInitiatePaste(ClipboardFormatId(13)),
+                            ClipboardMessage::SendInitiatePaste(ClipboardFormatId(format_id)),
                         )) {
-                            warn!("Failed to send eager fetch for CF_UNICODETEXT: {:?}", e);
+                            warn!("Failed to request upfront clipboard data: {:?}", e);
                             let mut pending = pending_portal_requests.write().await;
                             pending.retain(|(s, _, _)| *s != EAGER_FETCH_SERIAL);
                         }
@@ -1053,7 +1069,7 @@ impl ClipboardOrchestrator {
     async fn handle_rdp_data_request(
         format_id: u32,
         _converter: &FormatConverter,
-        _sync_manager: &Arc<RwLock<SyncManager>>,
+        sync_manager: &Arc<RwLock<SyncManager>>,
         clipboard_provider: &SharedClipboardProvider,
         server_event_sender: &ServerEventSender,
         local_advertised_formats: &Arc<RwLock<Vec<ClipboardFormat>>>,
@@ -1096,7 +1112,15 @@ impl ClipboardOrchestrator {
         };
         debug!("Mapped clipboard format ID {format_id} to a MIME type");
 
-        let portal_data = {
+        let selection_cleared = matches!(
+            sync_manager.read().await.state(),
+            super::sync::ClipboardState::PortalOwned(mimes) if mimes.is_empty()
+        );
+        let portal_data = if selection_cleared && format_id == 13 {
+            // Some clients retain their old value after an empty FormatList.
+            // Publish empty Unicode text without creating a Wayland source.
+            Vec::new()
+        } else {
             let provider_opt = clipboard_provider.read().await;
             if let Some(ref provider) = *provider_opt {
                 match provider.read_data(&mime_type).await {
@@ -1413,6 +1437,15 @@ impl ClipboardOrchestrator {
         // Eager fetch for data-control: provide data upfront instead of completing a transfer
         if serial == EAGER_FETCH_SERIAL {
             let provider = provider_opt.as_ref().expect("provider checked above");
+
+            if requested_mime == "image/png" {
+                // MS-RDPECLIP bitmaps have no BMP file header. The shared parser
+                // accepts both CF_DIB and CF_DIBV5 and preserves DIBV5 alpha.
+                let png = super::core::image::dibv5_to_png(&data)?;
+                provider.provide_data("image/png", png).await?;
+                provider.announce_formats(vec!["image/png".into()]).await?;
+                return Ok(());
+            }
 
             // Convert UTF-16LE from CF_UNICODETEXT to UTF-8
             if data.len() >= 2 {
@@ -1940,7 +1973,9 @@ impl ClipboardOrchestrator {
             })
             .collect();
 
-        if filtered_mime_types.is_empty() {
+        // A genuinely empty local selection must retire the client's old
+        // value. Only skip when policy filtering removed a nonempty selection.
+        if filtered_mime_types.is_empty() && original_mime_count != 0 {
             info!(
                 "No portal clipboard MIME types remain after config filtering; skipping RDP announcement"
             );
@@ -1959,7 +1994,13 @@ impl ClipboardOrchestrator {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        let rdp_formats = super::lib_mime_to_rdp_formats(&names);
+        let rdp_formats = if original_mime_count == 0 {
+            // An empty FormatList is treated as a handshake by some clients.
+            // A successful empty Unicode value reliably retires old content.
+            vec![ClipboardFormat::unicode_text()]
+        } else {
+            super::lib_mime_to_rdp_formats(&names)
+        };
         debug!(
             "Converted {} MIME types to {} RDP formats",
             filtered_mime_types.len(),
@@ -2468,6 +2509,16 @@ impl ClipboardOrchestrator {
         state.clear_outgoing();
         state.pending_descriptors.clear();
         state.portal_serial = None;
+        drop(state);
+
+        // Format IDs, pending responses and echo history belong to the old
+        // CLIPRDR connection. Do not advertise or consume them on reconnect.
+        self.pending_portal_requests.write().await.clear();
+        self.current_rdp_formats.write().await.clear();
+        self.local_advertised_formats.write().await.clear();
+        let mut sync = self.sync_manager.write().await;
+        sync.reset();
+        sync.reset_loop_detector();
     }
 
     /// Shutdown the clipboard manager
@@ -2535,6 +2586,22 @@ async fn finish_clipboard_task(mut handle: tokio::task::JoinHandle<()>, grace: D
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upfront_bitmap_selection_prefers_alpha_and_respects_image_policy() {
+        let formats = vec![ClipboardFormat::new(8), ClipboardFormat::new(17)];
+        assert_eq!(upfront_rdp_format(&formats, true), Some((17, "image/png")));
+        assert_eq!(
+            upfront_rdp_format(&formats[..1], true),
+            Some((8, "image/png"))
+        );
+        assert_eq!(upfront_rdp_format(&formats, false), None);
+        let with_text = vec![ClipboardFormat::new(17), ClipboardFormat::unicode_text()];
+        assert_eq!(
+            upfront_rdp_format(&with_text, true),
+            Some((13, "text/plain"))
+        );
+    }
 
     #[tokio::test]
     async fn shutdown_timeout_cancels_task_and_releases_resources() {
@@ -2700,6 +2767,89 @@ mod tests {
         assert!(finalize_without_replace(&incoming, &existing).is_err());
         assert_eq!(std::fs::read(&existing).unwrap(), b"old");
         assert_eq!(std::fs::read(&incoming).unwrap(), b"new");
+    }
+
+    #[tokio::test]
+    async fn local_selection_clear_provides_empty_unicode_without_a_source() {
+        let manager = ClipboardOrchestrator::new(Default::default())
+            .await
+            .unwrap();
+        *manager.local_advertised_formats.write().await = vec![ClipboardFormat::unicode_text()];
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        *manager.server_event_sender.write().await = Some(sender);
+
+        ClipboardOrchestrator::handle_portal_formats(
+            Vec::new(),
+            true,
+            &manager.converter,
+            &manager.config,
+            &manager.sync_manager,
+            &manager.server_event_sender,
+            &manager.local_advertised_formats,
+        )
+        .await
+        .unwrap();
+
+        let advertised = manager.local_advertised_formats.read().await;
+        assert_eq!(advertised.len(), 1);
+        assert_eq!(advertised[0].id, 13);
+        drop(advertised);
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ironrdp_server::ServerEvent::Clipboard(
+                ironrdp_cliprdr::backend::ClipboardMessage::SendInitiateCopy(formats)
+            ) if formats.len() == 1 && formats[0].id.0 == 13
+        ));
+
+        ClipboardOrchestrator::handle_rdp_data_request(
+            13,
+            &manager.converter,
+            &manager.sync_manager,
+            &manager.clipboard_provider,
+            &manager.server_event_sender,
+            &manager.local_advertised_formats,
+            &manager.file_transfer_state,
+        )
+        .await
+        .unwrap();
+        match receiver.try_recv().unwrap() {
+            ironrdp_server::ServerEvent::Clipboard(
+                ironrdp_cliprdr::backend::ClipboardMessage::SendFormatData(data),
+            ) => {
+                assert!(!data.is_error());
+                assert_eq!(data.data(), &[0, 0]);
+            }
+            _ => panic!("expected successful empty Unicode response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_releases_formats_requests_and_echo_history() {
+        let mut manager = ClipboardOrchestrator::new(Default::default())
+            .await
+            .unwrap();
+        let formats = vec![ClipboardFormat::unicode_text()];
+        *manager.current_rdp_formats.write().await = formats.clone();
+        *manager.local_advertised_formats.write().await = formats.clone();
+        manager.pending_portal_requests.write().await.push_back((
+            EAGER_FETCH_SERIAL,
+            "text/plain".into(),
+            std::time::Instant::now(),
+        ));
+        {
+            let mut sync = manager.sync_manager.write().await;
+            sync.handle_rdp_formats(formats);
+            assert!(sync.check_content(b"previous connection", true));
+        }
+
+        manager.clear_connection_state().await;
+
+        assert!(manager.pending_portal_requests.read().await.is_empty());
+        assert!(manager.current_rdp_formats.read().await.is_empty());
+        assert!(manager.local_advertised_formats.read().await.is_empty());
+        let mut sync = manager.sync_manager.write().await;
+        assert_eq!(sync.state(), &super::super::sync::ClipboardState::Idle);
+        assert!(sync.check_content(b"previous connection", false));
     }
 
     #[tokio::test]

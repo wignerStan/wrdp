@@ -28,10 +28,6 @@ pub struct WlrClipboardBackend {
     clipboard_tx: mpsc::Sender<ClipboardCommand>,
     /// Shared clipboard state (updated by event loop on selection changes).
     shared_clipboard: Arc<Mutex<SharedClipboardState>>,
-    /// Locally cached data for our own SetSelection (for immediate read-back).
-    local_data: HashMap<String, Vec<u8>>,
-    /// MIME types from our last SetSelection (for immediate read-back).
-    local_mime_types: Vec<String>,
 }
 
 impl WlrClipboardBackend {
@@ -43,8 +39,6 @@ impl WlrClipboardBackend {
         Self {
             clipboard_tx,
             shared_clipboard,
-            local_data: HashMap::new(),
-            local_mime_types: Vec::new(),
         }
     }
 }
@@ -72,9 +66,6 @@ impl ClipboardBackend for WlrClipboardBackend {
             "Setting clipboard"
         );
 
-        self.local_mime_types.clone_from(&data.mime_types);
-        self.local_data.clone_from(&data.data);
-
         self.clipboard_tx
             .send(ClipboardCommand::SetSelection {
                 mime_types: data.mime_types,
@@ -94,11 +85,6 @@ impl ClipboardBackend for WlrClipboardBackend {
     }
 
     fn read_selection(&self, mime_type: &str) -> Result<Option<Vec<u8>>> {
-        // Check local cache first
-        if let Some(data) = self.local_data.get(mime_type) {
-            return Ok(Some(data.clone()));
-        }
-
         // Find a matching MIME type from the compositor, tolerating charset differences
         // (e.g., "text/plain;charset=utf-8" vs "text/plain")
         let actual_mime = {
@@ -235,6 +221,7 @@ fn read_pipe_data(read_fd: OwnedFd) -> Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn make_test_backend() -> WlrClipboardBackend {
         let (tx, _rx) = mpsc::channel();
@@ -279,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_clipboard_caches_locally() {
+    fn test_set_clipboard_publishes_data_to_event_loop() {
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Mutex::new(SharedClipboardState::default()));
         let mut backend = WlrClipboardBackend::new(tx, shared);
@@ -291,11 +278,15 @@ mod tests {
 
         backend.set_clipboard(data).unwrap();
 
-        let result = backend.read_selection("text/html").unwrap();
-        assert_eq!(result.unwrap(), b"<b>Hi</b>");
-
         let cmd = rx.try_recv().unwrap();
-        assert!(matches!(cmd, ClipboardCommand::SetSelection { .. }));
+        match cmd {
+            ClipboardCommand::SetSelection { mime_types, data } => {
+                assert_eq!(mime_types, vec!["text/html"]);
+                assert_eq!(data.get("text/html").unwrap(), b"<b>Hi</b>");
+            }
+            _ => panic!("expected source publication"),
+        }
+        assert_eq!(backend.read_selection("text/html").unwrap(), None);
     }
 
     #[test]

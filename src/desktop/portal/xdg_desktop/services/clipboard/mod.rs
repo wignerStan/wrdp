@@ -423,4 +423,71 @@ mod tests {
             Some("text/plain;charset=utf-8")
         );
     }
+
+    fn backend_for_test(
+        protocol: ClipboardProtocol,
+        sender: mpsc::Sender<ClipboardCommand>,
+        shared: Arc<Mutex<SharedClipboardState>>,
+    ) -> Box<dyn ClipboardBackend> {
+        match protocol {
+            ClipboardProtocol::ExtDataControl => Box::new(ExtClipboardBackend::new(sender, shared)),
+            ClipboardProtocol::WlrDataControl => Box::new(WlrClipboardBackend::new(sender, shared)),
+        }
+    }
+
+    #[test]
+    fn clipboard_reads_follow_current_offer_after_remote_copy() {
+        use std::{collections::HashMap, io::Write, time::Duration};
+
+        for protocol in [
+            ClipboardProtocol::ExtDataControl,
+            ClipboardProtocol::WlrDataControl,
+        ] {
+            let (sender, receiver) = mpsc::channel();
+            let shared = Arc::new(Mutex::new(SharedClipboardState::default()));
+            let mut backend = backend_for_test(protocol, sender, Arc::clone(&shared));
+            backend
+                .set_clipboard(ClipboardData {
+                    mime_types: vec!["text/plain".into()],
+                    data: HashMap::from([("text/plain".into(), b"remote-old".to_vec())]),
+                })
+                .unwrap();
+            assert!(matches!(
+                receiver.recv().unwrap(),
+                ClipboardCommand::SetSelection { .. }
+            ));
+            {
+                let mut selection = shared.lock().unwrap();
+                selection.mime_types = vec!["text/plain;charset=utf-8".into()];
+                selection.serial = 2;
+            }
+            let response = std::thread::spawn(move || {
+                if let Ok(ClipboardCommand::ReceiveFromOffer { mime_type, fd }) =
+                    receiver.recv_timeout(Duration::from_secs(2))
+                {
+                    assert_eq!(mime_type, "text/plain;charset=utf-8");
+                    std::fs::File::from(fd)
+                        .write_all("local-new 中🙂".as_bytes())
+                        .unwrap();
+                }
+            });
+            let actual = backend.read_selection("text/plain").unwrap();
+            response.join().unwrap();
+            assert_eq!(
+                actual,
+                Some("local-new 中🙂".as_bytes().to_vec()),
+                "{protocol}"
+            );
+            {
+                let mut selection = shared.lock().unwrap();
+                selection.mime_types.clear();
+                selection.serial += 1;
+            }
+            assert_eq!(
+                backend.read_selection("text/plain").unwrap(),
+                None,
+                "{protocol}"
+            );
+        }
+    }
 }

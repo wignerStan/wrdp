@@ -287,7 +287,11 @@ impl DataControlState {
             shared.serial += 1;
             shared.mime_types.clone_from(&mime_types);
 
-            if let Some(ref callback) = shared.on_change {
+            // Our published RDP source is a mirrored selection. Only an
+            // external source may announce authoritative local ownership.
+            if self.current_source.is_none()
+                && let Some(ref callback) = shared.on_change
+            {
                 callback(mime_types);
             }
         }
@@ -309,7 +313,9 @@ impl DataControlState {
             shared.serial += 1;
             shared.mime_types.clear();
 
-            if let Some(ref callback) = shared.on_change {
+            if self.current_source.is_none()
+                && let Some(ref callback) = shared.on_change
+            {
                 callback(Vec::new());
             }
         }

@@ -34,6 +34,11 @@ latency rather than guaranteeing packet size.
   backend stops the worker, including when the source is silent.
 - SPA chunks are decoded from their valid offset and size. Only complete
   interleaved frames reach RDPSND.
+- PipeWire library initialization belongs to the process. Its Rust bindings
+  initialize once; audio/video workers drop only their owned resources.
+  Per-worker deinitialization breaks the next connection and can invalidate
+  another active worker. The [crate deinit contract](https://docs.rs/pipewire/0.9.2/pipewire/fn.deinit.html)
+  permits it only once after all threads and resources have stopped.
 - Client microphone redirection is a separate channel and is not enabled here.
 
 ## Validation boundary

@@ -523,12 +523,8 @@ fn run_pipewire_main_loop(
     drop(context);
     drop(main_loop);
 
-    // SAFETY: pipewire::deinit() must be called once per pipewire::init().
-    // All PipeWire resources (streams, core, context, main_loop) have been dropped.
-    // This thread called init() and no other code uses this PipeWire instance.
-    unsafe {
-        pipewire::deinit();
-    }
+    // The library is process-wide and init() is once-only. A session worker
+    // cannot deinitialize it while audio or another connection may still use it.
 
     info!("PipeWire thread exited");
 }
@@ -1242,6 +1238,45 @@ mod tests {
     fn test_thread_manager_creation() {
         // Cannot test without valid FD from portal
         // Full tests require integration testing with actual portal
+    }
+
+    #[test]
+    #[ignore = "requires packaged PipeWire client config and native protocol modules"]
+    fn stopped_video_workers_preserve_process_wide_pipewire_initialization() {
+        use std::os::fd::IntoRawFd as _;
+        pipewire::init();
+        // An absent client.conf must fail this fixture, not skip worker teardown.
+        let preflight_loop = MainLoopBox::new(None).unwrap();
+        let preflight_context = ContextBox::new(preflight_loop.loop_(), None).unwrap();
+        let (transport, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let preflight_core = preflight_context
+            .connect_fd(transport.into(), None)
+            .unwrap();
+        drop(preflight_core);
+        drop(preflight_context);
+        drop(preflight_loop);
+        for _ in 0..2 {
+            let (transport, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let (command_tx, command_rx) = std_mpsc::channel();
+            let (frame_tx, _) = std_mpsc::sync_channel(1);
+            let (state_tx, _) = std_mpsc::sync_channel(1);
+            let (_shutdown_tx, shutdown_rx) = std_mpsc::channel();
+            command_tx.send(PipeWireThreadCommand::Shutdown).unwrap();
+            // No portal exchange is needed: exercise owned native resources
+            // and the actual worker teardown with an immediate shutdown.
+            run_pipewire_main_loop(
+                transport.into_raw_fd(),
+                command_rx,
+                frame_tx,
+                state_tx,
+                shutdown_rx,
+            );
+            let main_loop = MainLoopBox::new(None);
+            assert!(
+                main_loop.is_ok(),
+                "another connection must be able to create a PipeWire loop"
+            );
+        }
     }
 
     #[test]

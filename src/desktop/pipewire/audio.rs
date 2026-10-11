@@ -571,10 +571,8 @@ pub fn spawn_audio_capture(
 
             capture.stop();
 
-            // SAFETY: Called once per init(), after all PipeWire resources dropped
-            unsafe {
-                pw::deinit();
-            }
+            // init() is process-wide and once-only. Per-capture teardown drops
+            // stream/core/context, but must preserve the library for reconnects.
         })
         .context("Failed to spawn audio capture thread")?;
 
@@ -728,6 +726,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(samples.to_i16(), [-16_383, 16_383, -32_767, 32_767]);
+    }
+
+    #[test]
+    fn stopped_audio_workers_preserve_process_wide_pipewire_initialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let invalid_remote = directory.path().join("not-a-socket");
+        std::fs::write(&invalid_remote, []).unwrap();
+        for _ in 0..2 {
+            let config = CaptureConfig {
+                remote_name: Some(invalid_remote.to_string_lossy().into_owned()),
+                ..CaptureConfig::default()
+            };
+            let mut handle = spawn_audio_capture(config, None, 1).unwrap();
+            // Sender closure occurs after the worker teardown has completed.
+            assert!(handle.receiver.blocking_recv().is_none());
+            assert!(handle.is_stopped());
+            let main_loop = pw::main_loop::MainLoopBox::new(None);
+            assert!(
+                main_loop.is_ok(),
+                "another connection must be able to create a PipeWire loop"
+            );
+        }
     }
 
     #[test]

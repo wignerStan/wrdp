@@ -120,8 +120,9 @@ pub fn init() {
 
 /// Deinitialize PipeWire library
 ///
-/// This should be called at application shutdown after all PipeWire
-/// resources have been dropped.
+/// Call at most once, at final process shutdown, after every PipeWire thread
+/// has ended and every resource has been dropped. Session workers must not
+/// call this: `pipewire::init()` is once-only and cannot initialize again.
 ///
 /// # Safety
 ///
@@ -131,7 +132,7 @@ pub fn init() {
 /// - No other PipeWire operations are in progress
 pub fn deinit() {
     // SAFETY: Caller ensures init() was called and all resources are dropped.
-    // The pipewire crate tracks initialization state internally.
+    // This is a final process-lifetime operation, not per-session cleanup.
     unsafe {
         pipewire::deinit();
     }

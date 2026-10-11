@@ -6,7 +6,7 @@ WRDP depends on software with its own copyright and license terms.
 
 WRDP uses [IronRDP](https://github.com/Devolutions/IronRDP) for RDP protocol state machines, capability negotiation, protocol data units and dynamic channels.
 
-The IronRDP dependency is pinned to revision `5435e59bbe6cd0ae32839b8cafe5300d42950fe3` from [`wignerStan/IronRDP`](https://github.com/wignerStan/IronRDP), based on upstream revision `e4143f26306a6639a889d80c1c484ca69c365a8f`. The fork adds ordered RDPSND teardown before server-initiated disconnects. IronRDP is licensed under Apache-2.0.
+The IronRDP dependency is pinned to revision `b67d44f1312ecf144d3511fc8a54f3b3ff2d4847` from [`wignerStan/IronRDP`](https://github.com/wignerStan/IronRDP), based on upstream revision `e4143f26306a6639a889d80c1c484ca69c365a8f`. The fork adds ordered RDPSND teardown before server-initiated disconnects and submits AVC444 V1 main and auxiliary views in one frame through the borrowed encoder API. IronRDP is licensed under Apache-2.0.
 
 ## Managed compositor
 

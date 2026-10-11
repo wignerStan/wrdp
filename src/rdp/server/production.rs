@@ -284,6 +284,28 @@ where
     }
 }
 
+/// Preserve admission and resource cleanup when a daemon signal cancels a connection.
+async fn finish_connection_on_shutdown<F, S>(
+    connection: F,
+    shutdown: S,
+    connection_invalid: &Notify,
+) -> (F::Output, Option<S::Output>)
+where
+    F: Future,
+    S: Future,
+{
+    tokio::pin!(connection);
+    tokio::select! {
+        result = &mut connection => (result, None),
+        signal = shutdown => {
+            connection_invalid.notify_one();
+            // The connection timeout wrapper defers cancellation until admission
+            // commits or rolls back. Await it rather than dropping its future.
+            (connection.await, Some(signal))
+        }
+    }
+}
+
 fn is_recoverable_accept_error(error: &io::Error) -> bool {
     if matches!(
         error.kind(),
@@ -308,6 +330,8 @@ fn accept_retry_delay(consecutive_errors: u32) -> Duration {
 }
 
 pub async fn run(mut config: Config) -> Result<()> {
+    let mut shutdown = crate::runtime::shutdown::ShutdownSignal::new()
+        .context("failed to register daemon shutdown signals")?;
     info!("starting wrdp production single-daemon listener");
 
     tokio::task::spawn_blocking(crate::sesman::reconcile_production_sessions)
@@ -495,7 +519,14 @@ pub async fn run(mut config: Config) -> Result<()> {
     let mut consecutive_accept_errors = 0_u32;
     loop {
         let (stream, peer) = loop {
-            match listener.accept().await {
+            let accepted = tokio::select! {
+                result = listener.accept() => result,
+                signal = shutdown.receive() => {
+                    info!(reason = ?signal.context("failed to receive daemon shutdown signal")?, "wrdp listener shutting down");
+                    return Ok(());
+                }
+            };
+            match accepted {
                 Ok(accepted) => {
                     consecutive_accept_errors = 0;
                     break accepted;
@@ -529,17 +560,21 @@ pub async fn run(mut config: Config) -> Result<()> {
             Some(Arc::clone(&connection_invalid));
 
         let connection = rdp_server.run_connection(stream);
-        let result = match Box::pin(run_with_connection_timeouts(
-            connection,
-            Arc::clone(&admission_started),
-            Arc::clone(&admission_started_notify),
-            Arc::clone(&admission_finished),
-            Arc::clone(&admission_finished_notify),
-            Arc::clone(&connection_invalid),
-            session_timeout,
-        ))
-        .await
-        {
+        let (result, shutdown_signal) = finish_connection_on_shutdown(
+            Box::pin(run_with_connection_timeouts(
+                connection,
+                Arc::clone(&admission_started),
+                Arc::clone(&admission_started_notify),
+                Arc::clone(&admission_finished),
+                Arc::clone(&admission_finished_notify),
+                Arc::clone(&connection_invalid),
+                session_timeout,
+            )),
+            shutdown.receive(),
+            &connection_invalid,
+        )
+        .await;
+        let result = match result {
             Ok(result) => result.map_err(anyhow::Error::from),
             Err(ConnectionCancellation::Timeout(ConnectionTimeoutPhase::PreAuth)) => Err(
                 anyhow::anyhow!("RDP pre-authentication timed out after 30 seconds"),
@@ -592,6 +627,10 @@ pub async fn run(mut config: Config) -> Result<()> {
         }
         if let Some(user) = active_bound_user.lock().await.take() {
             record_production_disconnect(user).await;
+        }
+        if let Some(signal) = shutdown_signal {
+            info!(reason = ?signal.context("failed to receive daemon shutdown signal")?, "wrdp connection cleanup finished; shutting down");
+            return Ok(());
         }
     }
 }
@@ -1779,6 +1818,106 @@ impl RdpServerDisplayUpdates for ProductionNoopUpdates {
 mod tests {
     use super::*;
     use crate::rdp::server::EgfxCodecPolicy;
+
+    #[tokio::test]
+    async fn daemon_shutdown_waits_for_connection_cleanup() {
+        let invalid = Arc::new(Notify::new());
+        let observed = Arc::new(Notify::new());
+        let cleanup = Arc::new(Notify::new());
+        let observed_task = Arc::clone(&observed);
+        let cleanup_task = Arc::clone(&cleanup);
+        let task = tokio::spawn(async move {
+            let connection = async {
+                invalid.notified().await;
+                observed_task.notify_one();
+                cleanup_task.notified().await;
+                42
+            };
+            finish_connection_on_shutdown(
+                connection,
+                std::future::ready(crate::runtime::shutdown::ShutdownReason::Terminate),
+                &invalid,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), observed.notified())
+            .await
+            .expect("connection cancellation");
+        assert!(
+            !task.is_finished(),
+            "shutdown must await connection cleanup"
+        );
+        cleanup.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cleanup deadline")
+            .expect("connection task");
+        assert_eq!(
+            result,
+            (
+                42,
+                Some(crate::runtime::shutdown::ShutdownReason::Terminate)
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_connection_completion_does_not_request_cancellation() {
+        let invalid = Notify::new();
+        let result = finish_connection_on_shutdown(
+            std::future::ready(7),
+            std::future::pending::<()>(),
+            &invalid,
+        )
+        .await;
+        assert_eq!(result, (7, None));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), invalid.notified())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_shutdown_defers_connection_drop_until_admission_finishes() {
+        let started = Arc::new(AtomicBool::new(true));
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_notify = Arc::new(Notify::new());
+        let finished_task = Arc::clone(&finished);
+        let finished_notify_task = Arc::clone(&finished_notify);
+        let invalid = Arc::new(Notify::new());
+        let task = tokio::spawn(async move {
+            finish_connection_on_shutdown(
+                run_with_connection_timeouts(
+                    std::future::pending::<()>(),
+                    started,
+                    Arc::new(Notify::new()),
+                    finished_task,
+                    finished_notify_task,
+                    Arc::clone(&invalid),
+                    None,
+                ),
+                std::future::ready(()),
+                &invalid,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !task.is_finished(),
+            "an in-flight admission must commit or roll back first"
+        );
+        finished.store(true, Ordering::Release);
+        finished_notify.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("admission cleanup deadline")
+            .expect("connection task");
+        assert_eq!(
+            result,
+            (Err(ConnectionCancellation::SessionInvalid), Some(()))
+        );
+    }
 
     fn raw_frame(
         width: u32,

@@ -4,10 +4,13 @@
 //! bounded channel, and runs on a dedicated thread because PipeWire objects are
 //! not Send.
 
-use std::convert::TryInto;
+use std::borrow::Cow;
 use std::mem;
+use std::os::unix::fs::FileTypeExt;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pipewire as pw;
@@ -21,9 +24,9 @@ use tracing::{debug, error, info, trace, warn};
 /// Audio sample format
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioFormat {
-    /// 32-bit float (native endian)
+    /// 32-bit float (little endian)
     F32,
-    /// 16-bit signed integer (native endian)
+    /// 16-bit signed integer (little endian)
     I16,
 }
 
@@ -53,10 +56,55 @@ pub struct CaptureConfig {
     pub channels: u32,
     /// Output sample format
     pub format: AudioFormat,
-    /// Frames per buffer (default: 1024, ~21ms at 48kHz)
+    /// Requested latency in frames; PipeWire may choose a different graph quantum.
     pub buffer_frames: u32,
     /// Optional PipeWire remote name or absolute socket path.
     pub remote_name: Option<String>,
+}
+
+impl CaptureConfig {
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            (1..=i32::MAX as u32).contains(&self.sample_rate),
+            "audio sample rate is outside the SPA integer range"
+        );
+        anyhow::ensure!(
+            (1..=spa::param::audio::MAX_CHANNELS as u32).contains(&self.channels),
+            "audio channels must be between 1 and 64"
+        );
+        anyhow::ensure!(self.buffer_frames > 0, "audio latency must be nonzero");
+        Ok(())
+    }
+
+    fn format_pod(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut audio_info = spa::param::audio::AudioInfoRaw::new();
+        audio_info.set_format(self.format.to_spa_format());
+        audio_info.set_rate(self.sample_rate);
+        audio_info.set_channels(self.channels);
+        let mut positions = [0; spa::param::audio::MAX_CHANNELS];
+        match self.channels {
+            1 => positions[0] = libspa_sys::SPA_AUDIO_CHANNEL_MONO,
+            2 => {
+                positions[0] = libspa_sys::SPA_AUDIO_CHANNEL_FL;
+                positions[1] = libspa_sys::SPA_AUDIO_CHANNEL_FR;
+            }
+            _ => {}
+        }
+        audio_info.set_position(positions);
+        let object = spa::pod::Object {
+            type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+            id: spa::param::ParamType::EnumFormat.as_raw(),
+            properties: audio_info.into(),
+        };
+        Ok(spa::pod::serialize::PodSerializer::serialize(
+            std::io::Cursor::new(Vec::new()),
+            &spa::pod::Value::Object(object),
+        )
+        .context("Failed to serialize audio format pod")?
+        .0
+        .into_inner())
+    }
 }
 
 impl Default for CaptureConfig {
@@ -138,6 +186,120 @@ impl AudioCaptureHandle {
     }
 }
 
+impl Drop for AudioCaptureHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Decode complete interleaved frames from the valid SPA memory region.
+/// SPA chunk offsets wrap modulo maxsize; size cannot exceed that allocation.
+fn decode_chunk(
+    data: &[u8],
+    offset: usize,
+    size: usize,
+    format: spa::param::audio::AudioFormat,
+    channels: u32,
+    output: AudioFormat,
+) -> Option<AudioSamples> {
+    use spa::param::audio::AudioFormat as SpaFormat;
+    if data.is_empty() || channels == 0 {
+        return None;
+    }
+    let width = match format {
+        SpaFormat::S16LE | SpaFormat::S16BE => 2,
+        SpaFormat::F32LE | SpaFormat::F32BE => 4,
+        _ => return None,
+    };
+    let frame_width = width * channels as usize;
+    let size = size.min(data.len()) / frame_width * frame_width;
+    if size == 0 {
+        return None;
+    }
+    let offset = offset % data.len();
+    let bytes = if offset + size <= data.len() {
+        Cow::Borrowed(&data[offset..offset + size])
+    } else {
+        Cow::Owned(
+            data[offset..]
+                .iter()
+                .chain(data[..offset].iter())
+                .take(size)
+                .copied()
+                .collect(),
+        )
+    };
+    let samples = match format {
+        SpaFormat::S16LE | SpaFormat::S16BE => {
+            let integers = bytes
+                .chunks_exact(2)
+                .map(|b| {
+                    let bytes = [b[0], b[1]];
+                    if format == SpaFormat::S16LE {
+                        i16::from_le_bytes(bytes)
+                    } else {
+                        i16::from_be_bytes(bytes)
+                    }
+                })
+                .collect();
+            AudioSamples::I16(integers)
+        }
+        SpaFormat::F32LE | SpaFormat::F32BE => {
+            let floats = bytes
+                .chunks_exact(4)
+                .map(|b| {
+                    let bytes = [b[0], b[1], b[2], b[3]];
+                    if format == SpaFormat::F32LE {
+                        f32::from_le_bytes(bytes)
+                    } else {
+                        f32::from_be_bytes(bytes)
+                    }
+                })
+                .collect();
+            AudioSamples::F32(floats)
+        }
+        _ => return None,
+    };
+    Some(match (output, samples) {
+        (AudioFormat::I16, samples @ AudioSamples::I16(_))
+        | (AudioFormat::F32, samples @ AudioSamples::F32(_)) => samples,
+        (AudioFormat::I16, samples) => AudioSamples::I16(samples.to_i16()),
+        (AudioFormat::F32, samples) => AudioSamples::F32(samples.to_f32()),
+    })
+}
+
+/// Compositor autostart can publish its socket after RDPSND negotiation.
+/// Readiness waits stay on the capture thread and stop with the connection.
+fn wait_for_remote(remote: Option<&str>, stopped: &AtomicBool, timeout: Duration) -> Result<bool> {
+    let Some(path) = remote.map(Path::new).filter(|path| path.is_absolute()) else {
+        return Ok(!stopped.load(Ordering::SeqCst));
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        if stopped.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    metadata.file_type().is_socket(),
+                    "PipeWire remote is not a Unix socket: {}",
+                    path.display()
+                );
+                return Ok(true);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Failed to inspect PipeWire socket"),
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "PipeWire socket did not become ready: {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 struct CaptureUserData {
     format: spa::param::audio::AudioInfoRaw,
     output_format: AudioFormat,
@@ -182,6 +344,14 @@ impl AudioCapture {
     /// Call from a dedicated thread. Connects to the PipeWire daemon,
     /// negotiates audio format, and delivers samples until stopped.
     pub fn start_capture(&self, node_id: Option<u32>) -> Result<()> {
+        let pod_bytes = self.config.format_pod()?;
+        if !wait_for_remote(
+            self.config.remote_name.as_deref(),
+            &self.stop_signal,
+            Duration::from_secs(5),
+        )? {
+            return Ok(());
+        }
         info!(
             "Starting audio capture: {}Hz, {} channels, format={:?}, node_id={:?}",
             self.config.sample_rate, self.config.channels, self.config.format, node_id
@@ -214,6 +384,10 @@ impl AudioCapture {
         }
 
         props.insert("stream.capture.sink", "true");
+        props.insert(
+            "node.latency",
+            format!("{}/{}", self.config.buffer_frames, self.config.sample_rate),
+        );
 
         let stream = pw::stream::StreamBox::new(&core, "wrdp-audio-capture", props)
             .context("Failed to create PipeWire stream")?;
@@ -302,90 +476,19 @@ impl AudioCapture {
 
                 let data = &mut datas[0];
                 let chunk = data.chunk();
-                let size = chunk.size() as usize;
-
-                if size == 0 {
-                    return;
-                }
-
+                let (offset, size) = (chunk.offset() as usize, chunk.size() as usize);
                 let Some(slice) = data.data() else {
                     return;
                 };
-
-                let n_channels = user_data.format.channels() as usize;
-                if n_channels == 0 {
+                let Some(samples) = decode_chunk(
+                    slice,
+                    offset,
+                    size,
+                    user_data.format.format(),
+                    user_data.format.channels(),
+                    user_data.output_format,
+                ) else {
                     return;
-                }
-
-                let samples = match user_data.format.format() {
-                    spa::param::audio::AudioFormat::F32LE
-                    | spa::param::audio::AudioFormat::F32BE => {
-                        let byte_count = size.min(slice.len());
-                        let sample_count = byte_count / mem::size_of::<f32>();
-                        let mut f32_samples = Vec::with_capacity(sample_count);
-
-                        for i in 0..sample_count {
-                            let start = i * mem::size_of::<f32>();
-                            let end = start + mem::size_of::<f32>();
-                            if end <= slice.len() {
-                                let bytes: [u8; 4] = slice[start..end].try_into().unwrap_or([0; 4]);
-                                let sample = if user_data.format.format()
-                                    == spa::param::audio::AudioFormat::F32LE
-                                {
-                                    f32::from_le_bytes(bytes)
-                                } else {
-                                    f32::from_be_bytes(bytes)
-                                };
-                                f32_samples.push(sample);
-                            }
-                        }
-
-                        match user_data.output_format {
-                            AudioFormat::F32 => AudioSamples::F32(f32_samples),
-                            AudioFormat::I16 => {
-                                let i16_samples: Vec<i16> = f32_samples
-                                    .iter()
-                                    .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
-                                    .collect();
-                                AudioSamples::I16(i16_samples)
-                            }
-                        }
-                    }
-                    spa::param::audio::AudioFormat::S16LE
-                    | spa::param::audio::AudioFormat::S16BE => {
-                        let byte_count = size.min(slice.len());
-                        let sample_count = byte_count / mem::size_of::<i16>();
-                        let mut i16_samples = Vec::with_capacity(sample_count);
-
-                        for i in 0..sample_count {
-                            let start = i * mem::size_of::<i16>();
-                            let end = start + mem::size_of::<i16>();
-                            if end <= slice.len() {
-                                let bytes: [u8; 2] = slice[start..end].try_into().unwrap_or([0; 2]);
-                                let sample = if user_data.format.format()
-                                    == spa::param::audio::AudioFormat::S16LE
-                                {
-                                    i16::from_le_bytes(bytes)
-                                } else {
-                                    i16::from_be_bytes(bytes)
-                                };
-                                i16_samples.push(sample);
-                            }
-                        }
-
-                        match user_data.output_format {
-                            AudioFormat::I16 => AudioSamples::I16(i16_samples),
-                            AudioFormat::F32 => {
-                                let f32_samples: Vec<f32> =
-                                    i16_samples.iter().map(|&s| s as f32 / 32768.0).collect();
-                                AudioSamples::F32(f32_samples)
-                            }
-                        }
-                    }
-                    other => {
-                        trace!("Unsupported audio format: {:?}", other);
-                        return;
-                    }
                 };
 
                 let sample_count = samples.len();
@@ -408,24 +511,6 @@ impl AudioCapture {
             })
             .register()
             .context("Failed to register stream listener")?;
-
-        // Build format parameters for negotiation
-        let mut audio_info = spa::param::audio::AudioInfoRaw::new();
-        audio_info.set_format(self.config.format.to_spa_format());
-
-        let obj = spa::pod::Object {
-            type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
-            id: spa::param::ParamType::EnumFormat.as_raw(),
-            properties: audio_info.into(),
-        };
-
-        let pod_bytes: Vec<u8> = spa::pod::serialize::PodSerializer::serialize(
-            std::io::Cursor::new(Vec::new()),
-            &spa::pod::Value::Object(obj),
-        )
-        .context("Failed to serialize audio format pod")?
-        .0
-        .into_inner();
 
         let pod = Pod::from_bytes(&pod_bytes).context("Failed to create pod from bytes")?;
 
@@ -471,6 +556,8 @@ pub fn spawn_audio_capture(
     node_id: Option<u32>,
     channel_size: usize,
 ) -> Result<AudioCaptureHandle> {
+    config.validate()?;
+    anyhow::ensure!(channel_size > 0, "audio channel capacity must be nonzero");
     let (capture, handle) = AudioCapture::new(config, channel_size);
 
     std::thread::Builder::new()
@@ -481,6 +568,8 @@ pub fn spawn_audio_capture(
             if let Err(e) = capture.start_capture(node_id) {
                 error!("Audio capture error: {:#}", e);
             }
+
+            capture.stop();
 
             // SAFETY: Called once per init(), after all PipeWire resources dropped
             unsafe {
@@ -520,6 +609,180 @@ mod tests {
         let float = AudioSamples::I16(vec![0, -16_384, 16_384]).to_f32();
         for (actual, expected) in float.into_iter().zip([0.0, -0.5, 0.5]) {
             assert!((actual - expected).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn negotiation_pod_preserves_pcm_rate_channels_and_positions() {
+        let config = CaptureConfig {
+            format: AudioFormat::I16,
+            ..CaptureConfig::default()
+        };
+        let bytes = config.format_pod().unwrap();
+        let pod = Pod::from_bytes(&bytes).unwrap();
+        let mut actual = spa::param::audio::AudioInfoRaw::new();
+        actual.parse(pod).unwrap();
+        assert_eq!(actual.format(), spa::param::audio::AudioFormat::S16LE);
+        assert_eq!(actual.rate(), 48_000);
+        assert_eq!(actual.channels(), 2);
+        assert_eq!(
+            &actual.position()[..2],
+            &[
+                libspa_sys::SPA_AUDIO_CHANNEL_FL,
+                libspa_sys::SPA_AUDIO_CHANNEL_FR
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_capture_settings_fail_before_thread_creation() {
+        let cases = [
+            CaptureConfig {
+                sample_rate: 0,
+                ..CaptureConfig::default()
+            },
+            CaptureConfig {
+                channels: 0,
+                ..CaptureConfig::default()
+            },
+            CaptureConfig {
+                channels: 65,
+                ..CaptureConfig::default()
+            },
+            CaptureConfig {
+                buffer_frames: 0,
+                ..CaptureConfig::default()
+            },
+        ];
+        for config in cases {
+            assert!(spawn_audio_capture(config, None, 1).is_err());
+        }
+        assert!(spawn_audio_capture(CaptureConfig::default(), None, 0).is_err());
+    }
+
+    #[test]
+    fn decoding_uses_chunk_offset_and_complete_stereo_frames() {
+        let bytes = [0xaa, 0xbb, 0x34, 0x12, 0xfe, 0xff, 0x78, 0x56, 0xdd];
+        let samples = decode_chunk(
+            &bytes,
+            2,
+            7,
+            spa::param::audio::AudioFormat::S16LE,
+            2,
+            AudioFormat::I16,
+        )
+        .unwrap();
+        assert_eq!(samples.to_i16(), [0x1234, -2]);
+        assert!(
+            decode_chunk(
+                &[],
+                0,
+                4,
+                spa::param::audio::AudioFormat::S16LE,
+                2,
+                AudioFormat::I16
+            )
+            .is_none()
+        );
+        assert!(
+            decode_chunk(
+                &bytes,
+                0,
+                3,
+                spa::param::audio::AudioFormat::S16LE,
+                2,
+                AudioFormat::I16
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn decoding_wraps_offsets_and_clamps_chunk_size() {
+        let bytes = [0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x11, 0x11];
+        let samples = decode_chunk(
+            &bytes,
+            14,
+            100,
+            spa::param::audio::AudioFormat::S16LE,
+            2,
+            AudioFormat::I16,
+        )
+        .unwrap();
+        assert_eq!(samples.to_i16(), [0x1111, 0x2222, 0x3333, 0x4444]);
+    }
+
+    #[test]
+    fn decoding_preserves_big_endian_float_signal_and_clips_pcm() {
+        let bytes = [-0.5_f32, 0.5, -2.0, 2.0]
+            .into_iter()
+            .flat_map(f32::to_be_bytes)
+            .collect::<Vec<_>>();
+        let samples = decode_chunk(
+            &bytes,
+            0,
+            bytes.len(),
+            spa::param::audio::AudioFormat::F32BE,
+            2,
+            AudioFormat::I16,
+        )
+        .unwrap();
+        assert_eq!(samples.to_i16(), [-16_383, 16_383, -32_767, 32_767]);
+    }
+
+    #[test]
+    fn dropping_capture_handle_stops_a_silent_worker() {
+        let (capture, handle) = AudioCapture::new(CaptureConfig::default(), 1);
+        drop(handle);
+        assert!(capture.stop_signal.load(Ordering::SeqCst));
+        assert!(capture.sender.is_closed());
+    }
+
+    #[test]
+    fn socket_readiness_is_bounded_and_accepts_delayed_unix_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("pipewire-0");
+        let stopped = AtomicBool::new(false);
+        assert!(wait_for_remote(socket.to_str(), &stopped, Duration::ZERO).is_err());
+        let path = socket.clone();
+        let publisher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            std::os::unix::net::UnixListener::bind(path).unwrap()
+        });
+        assert!(wait_for_remote(socket.to_str(), &stopped, Duration::from_secs(1)).unwrap());
+        let listener = publisher.join().unwrap();
+        drop(listener);
+        stopped.store(true, Ordering::SeqCst);
+        assert!(!wait_for_remote(socket.to_str(), &stopped, Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
+    fn stopping_capture_cancels_pending_socket_readiness() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("pipewire-0");
+        let stopped = Arc::new(AtomicBool::new(false));
+        let signal = stopped.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            signal.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        assert!(!wait_for_remote(socket.to_str(), &stopped, Duration::from_secs(5)).unwrap());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        canceller.join().unwrap();
+    }
+
+    #[test]
+    fn socket_readiness_rejects_regular_files_and_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, []).unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        for path in [&file, &link] {
+            assert!(
+                wait_for_remote(path.to_str(), &AtomicBool::new(false), Duration::ZERO).is_err()
+            );
         }
     }
 

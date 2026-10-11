@@ -95,11 +95,16 @@ paths: ## Print resolved development paths without building or creating director
 	@$(PYTHON) -B scripts/dev-paths.py show
 
 # Order-only prerequisite also covers recursive Make invocations and subprocesses.
-deps rustup-install rustup toolchain-check metadata fetch fmt fmt-fix check clippy test test-paths build build-release compositor-configure compositor-build provision-system provision-user validate-production async-start: | prepare-paths
+deps rustup-install rustup toolchain-check metadata fetch fmt fmt-fix check clippy test test-paths test-desktop build build-release compositor-configure compositor-build provision-system provision-user validate-production async-start: | prepare-paths
 
 .PHONY: test-paths
 test-paths: ## Run focused path/provisioning tests with retained Python CPU/heap profiles.
 	$(PYTHON) scripts/profile-path-tests.py
+
+# Desktop resource validation does not need a running display or audio daemon.
+.PHONY: test-desktop
+test-desktop: ## Validate managed desktop provisioning and script syntax.
+	$(PYTHON) -m unittest discover -s scripts -p test_desktop_provisioning.py
 
 # Host packages needed for local Rust builds, compositor builds,
 # and day-to-day repository work on Debian.
@@ -245,7 +250,7 @@ compositor-clean: ## Remove only this checkout's compositor build; refuse active
 
 .PHONY: install-session-defaults
 install-session-defaults: ## Install the minimal managed desktop configuration and Platinum theme.
-	$(SUDO) install -d -m 0755 /etc/wrdp/labwc /etc/wrdp/waybar /etc/wrdp/mako /etc/wrdp/wallpaper /usr/lib/wrdp /usr/share/themes
+	$(SUDO) install -d -m 0755 /etc/wrdp/labwc /etc/wrdp/waybar /etc/wrdp/mako /etc/wrdp/wallpaper /etc/wrdp/pipewire/pipewire.conf.d /usr/lib/wrdp /usr/share/themes
 	$(SUDO) rm -rf /usr/share/themes/PlatinumTheme-wrdp-compositor
 	$(SUDO) cp -a vendor/wrdp-compositor/themes/PlatinumTheme-wrdp-compositor /usr/share/themes/
 	$(SUDO) chmod -R a+rX /usr/share/themes/PlatinumTheme-wrdp-compositor
@@ -257,6 +262,12 @@ install-session-defaults: ## Install the minimal managed desktop configuration a
 	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/waybar/style.css /etc/wrdp/waybar/style.css
 	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/mako/config /etc/wrdp/mako/config
 	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/wallpaper/wallpaper.conf /etc/wrdp/wallpaper/wallpaper.conf
+	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/pipewire/pipewire.conf.d/10-wrdp-audio.conf /etc/wrdp/pipewire/pipewire.conf.d/10-wrdp-audio.conf
+	@if [ -r /usr/share/pipewire/pipewire.conf ]; then \
+		$(SUDO) install -m 0644 /usr/share/pipewire/pipewire.conf /etc/wrdp/pipewire/pipewire.conf; \
+	else \
+		printf 'PipeWire runtime package is absent; managed session audio remains optional.\n'; \
+	fi
 	$(SUDO) install -m 0755 vendor/wrdp-compositor/contrib/wrdp/bin/wrdp-desktop-action /usr/lib/wrdp/wrdp-desktop-action
 	$(SUDO) install -m 0755 vendor/wrdp-compositor/contrib/wrdp/bin/wrdp-desktop-session /usr/lib/wrdp/wrdp-desktop-session
 	$(SUDO) install -m 0755 vendor/wrdp-compositor/contrib/wrdp/bin/wrdp-wallpaper /usr/lib/wrdp/wrdp-wallpaper

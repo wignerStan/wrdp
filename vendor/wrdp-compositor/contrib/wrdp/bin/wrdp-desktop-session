@@ -208,6 +208,30 @@ dbus-run-session -- bash -euo pipefail -c '
     }
     trap stop EXIT HUP INT TERM
 
+    # Audio belongs to this compositor generation and its private runtime.
+    # Only the daemon uses the WRDP config; native and Pulse clients keep theirs.
+    if command -v pipewire >/dev/null 2>&1 &&
+       command -v pipewire-pulse >/dev/null 2>&1 &&
+       command -v wireplumber >/dev/null 2>&1 &&
+       [[ -r /etc/wrdp/pipewire/pipewire.conf ]]; then
+        PIPEWIRE_CONFIG_DIR=/etc/wrdp/pipewire pipewire &
+        pipewire_pid=$!
+        children+=("$pipewire_pid")
+        for ((attempt=0; attempt<100; attempt++)); do
+            kill -0 "$pipewire_pid" 2>/dev/null || exit 1
+            [[ -S "$XDG_RUNTIME_DIR/pipewire-0" ]] && break
+            sleep 0.05
+        done
+        if [[ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ]]; then
+            printf "session PipeWire socket did not become ready\n" >&2
+            exit 1
+        fi
+        pipewire-pulse & children+=("$!")
+        wireplumber & children+=("$!")
+    else
+        printf "session audio unavailable: install PipeWire, WirePlumber, and WRDP audio defaults\n" >&2
+    fi
+
     if command -v swaybg >/dev/null 2>&1; then
         /usr/lib/wrdp/wrdp-wallpaper & children+=("$!")
     fi

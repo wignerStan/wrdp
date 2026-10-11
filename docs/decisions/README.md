@@ -12,3 +12,4 @@
 | [0008](0008-use-ini-configuration.md) | Use INI files for server and session-manager configuration | accepted |
 | [0009](0009-persist-session-process-identity.md) | Persist PID reuse-safe process identity for sessions | accepted |
 | [0010](0010-use-one-server-lifecycle.md) | Use one RDP listener and connection lifecycle | accepted |
+| [0011](0011-own-session-audio.md) | Own audio in the managed desktop session | accepted |

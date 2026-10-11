@@ -12,6 +12,10 @@ packages:
   - libnotify-bin
   - mako-notifier
   - python3-yaml
+  - pipewire
+  - pipewire-bin
+  - pipewire-pulse
+  - wireplumber
   - swaybg
   - thunar
   - tumbler
@@ -27,12 +31,20 @@ directories:
     permissions: "0755"
   - path: /etc/wrdp/wallpaper
     permissions: "0755"
+  - path: /etc/wrdp/pipewire/pipewire.conf.d
+    permissions: "0755"
   - path: /usr/lib/wrdp
     permissions: "0755"
   - path: /usr/share/themes
     permissions: "0755"
 
 copy_files:
+  - source: /usr/share/pipewire/pipewire.conf
+    destination: /etc/wrdp/pipewire/pipewire.conf
+    permissions: "0644"
+  - source: ${WRDP_SOURCE_DIR}/vendor/wrdp-compositor/contrib/wrdp/pipewire/pipewire.conf.d/10-wrdp-audio.conf
+    destination: /etc/wrdp/pipewire/pipewire.conf.d/10-wrdp-audio.conf
+    permissions: "0644"
   - source: ${WRDP_SOURCE_DIR}/vendor/wrdp-compositor/contrib/wrdp/labwc/autostart
     destination: /etc/wrdp/labwc/autostart
     permissions: "0644"

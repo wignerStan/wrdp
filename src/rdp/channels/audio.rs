@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::desktop::pipewire::audio::{
-    AudioFormat as CaptureFormat, CaptureConfig, spawn_audio_capture,
+    AudioFormat as CaptureFormat, AudioSamples, CaptureConfig, spawn_audio_capture,
 };
 
 const SAMPLE_RATE: u32 = 48_000;
@@ -106,6 +106,12 @@ impl PipeWireRdpsndHandler {
     }
 }
 
+impl Drop for PipeWireRdpsndHandler {
+    fn drop(&mut self) {
+        self.stop_capture();
+    }
+}
+
 impl RdpsndServerHandler for PipeWireRdpsndHandler {
     fn get_formats(&self) -> &[AudioFormat] {
         &self.formats
@@ -145,12 +151,6 @@ impl RdpsndServerHandler for PipeWireRdpsndHandler {
                 )) as Box<dyn RdpsndError>
             })?;
         let socket = runtime_dir.join("pipewire-0");
-        if !socket.exists() {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("PipeWire socket not found: {}", socket.display()),
-            )));
-        }
 
         // Connect directly to the authenticated user's PipeWire socket rather
         // than mutating process-wide environment in the multi-user daemon.
@@ -168,8 +168,11 @@ impl RdpsndServerHandler for PipeWireRdpsndHandler {
         self.forward_task = Some(tokio::spawn(async move {
             let started = Instant::now();
             while let Some(samples) = capture.receiver.recv().await {
-                let pcm = samples
-                    .to_i16()
+                let integer_samples = match samples {
+                    AudioSamples::I16(samples) => samples,
+                    samples => samples.to_i16(),
+                };
+                let pcm = integer_samples
                     .into_iter()
                     .flat_map(i16::to_le_bytes)
                     .collect::<Vec<_>>();
@@ -189,8 +192,9 @@ impl RdpsndServerHandler for PipeWireRdpsndHandler {
                 }
             }
             warn!("PipeWire audio capture ended");
+            let _ = event_sender.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Close));
         }));
-        info!(runtime = %runtime_dir.display(), "PipeWire RDPSND PCM streaming started");
+        info!(runtime = %runtime_dir.display(), "PipeWire RDPSND PCM capture requested");
         Ok(())
     }
 
@@ -221,6 +225,15 @@ fn pcm_format() -> AudioFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_rdpsnd_backend_stops_connection_owned_capture() {
+        let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handler = PipeWireRdpsndHandler::new(AudioTarget::default(), None);
+        handler.stop_signal = Some(signal.clone());
+        drop(handler);
+        assert!(signal.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[test]
     fn advertises_standard_stereo_pcm() {

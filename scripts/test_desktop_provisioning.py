@@ -40,6 +40,7 @@ class DesktopProvisioningTests(unittest.TestCase):
             "mako-notifier",
             "libnotify-bin",
             "python3-yaml",
+            "pipewire", "pipewire-bin", "pipewire-pulse", "wireplumber",
         }
         self.assertTrue(required.issubset(set(system["packages"])))
         forbidden = {"xfce4-session", "xfce4-panel", "xfwm4", "xfdesktop4"}
@@ -48,7 +49,13 @@ class DesktopProvisioningTests(unittest.TestCase):
         source_root = str(ROOT)
         for item in system["copy_files"] + system["copy_trees"]:
             source = Path(item["source"].replace("${WRDP_SOURCE_DIR}", source_root))
-            self.assertTrue(source.exists(), source)
+            if source == Path("/usr/share/pipewire/pipewire.conf"):
+                # Runtime provisioning installs this package before copying it.
+                self.assertIn("pipewire", system["packages"])
+                self.assertEqual(item["destination"], "/etc/wrdp/pipewire/pipewire.conf")
+                self.assertEqual(item["permissions"], "0644")
+            else:
+                self.assertTrue(source.exists(), source)
 
     def test_assets_parse_and_autostart_has_one_owner_each(self):
         waybar = json.loads((CONTRIB / "waybar/config.jsonc").read_text(encoding="utf-8"))
@@ -85,8 +92,8 @@ class DesktopProvisioningTests(unittest.TestCase):
         self.assertIn("process_group_alive \"$supervisor_pid\"", supervisor)
         self.assertIn("desktop process group did not terminate", supervisor)
         self.assertIn("mv -f \"$temporary\" \"$bus_file\"", supervisor)
-        for process in ("swaybg", "mako", "waybar"):
-            self.assertEqual(supervisor.count(f"command -v {process}"), 1)
+        for process in ("swaybg", "mako", "waybar", "pipewire", "pipewire-pulse", "wireplumber"):
+            self.assertEqual(supervisor.count(f"command -v {process} "), 1)
         for forbidden in ("xfce4-session", "xfce4-panel", "xfwm4", "xfdesktop"):
             self.assertNotIn(forbidden, autostart)
 

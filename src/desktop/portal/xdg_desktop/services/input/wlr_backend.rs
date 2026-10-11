@@ -79,6 +79,61 @@ fn keymap_payload(keymap: &str) -> Vec<u8> {
     payload
 }
 
+// wlroots 0.18 associates axis_source with the last axis request, not the
+// whole frame. Select each axis before setting its source, including stops.
+#[derive(Clone, Copy)]
+enum ScrollAxisValue {
+    Continuous(f64),
+    Discrete(i32),
+    Stop,
+}
+
+#[derive(Clone, Copy)]
+enum ScrollRequest {
+    Axis {
+        axis: wayland_client::protocol::wl_pointer::Axis,
+        time: u32,
+        value: ScrollAxisValue,
+    },
+    Source(wayland_client::protocol::wl_pointer::AxisSource),
+}
+
+fn scroll_axis_requests(
+    axis: wayland_client::protocol::wl_pointer::Axis,
+    time: u32,
+    value: ScrollAxisValue,
+) -> [ScrollRequest; 2] {
+    use wayland_client::protocol::wl_pointer::AxisSource;
+    let source = match value {
+        ScrollAxisValue::Discrete(_) => AxisSource::Wheel,
+        ScrollAxisValue::Continuous(_) | ScrollAxisValue::Stop => AxisSource::Continuous,
+    };
+    [
+        ScrollRequest::Axis { axis, time, value },
+        ScrollRequest::Source(source),
+    ]
+}
+
+fn send_scroll_axis(
+    pointer: &ZwlrVirtualPointerV1,
+    axis: wayland_client::protocol::wl_pointer::Axis,
+    time: u32,
+    value: ScrollAxisValue,
+) {
+    for request in scroll_axis_requests(axis, time, value) {
+        match request {
+            ScrollRequest::Axis { axis, time, value } => match value {
+                ScrollAxisValue::Continuous(delta) => pointer.axis(time, axis, delta),
+                ScrollAxisValue::Discrete(steps) => {
+                    pointer.axis_discrete(time, axis, f64::from(steps) * 15.0, steps);
+                }
+                ScrollAxisValue::Stop => pointer.axis_stop(time, axis),
+            },
+            ScrollRequest::Source(source) => pointer.axis_source(source),
+        }
+    }
+}
+
 /// wlr virtual input backend.
 ///
 /// Implements the [`InputBackend`] trait using wlroots virtual input protocols.
@@ -588,21 +643,37 @@ impl InputBackend for WlrInputBackend {
                 if let Some(ref pointer) = ctx.pointer {
                     use wayland_client::protocol::wl_pointer::Axis;
 
-                    // Set axis source before axis events (protocol compliance)
-                    pointer
-                        .axis_source(wayland_client::protocol::wl_pointer::AxisSource::Continuous);
-
                     if dy.abs() > f64::EPSILON {
-                        pointer.axis(time_ms(time_usec), Axis::VerticalScroll, dy);
+                        send_scroll_axis(
+                            pointer,
+                            Axis::VerticalScroll,
+                            time_ms(time_usec),
+                            ScrollAxisValue::Continuous(dy),
+                        );
                     }
                     if dx.abs() > f64::EPSILON {
-                        pointer.axis(time_ms(time_usec), Axis::HorizontalScroll, dx);
+                        send_scroll_axis(
+                            pointer,
+                            Axis::HorizontalScroll,
+                            time_ms(time_usec),
+                            ScrollAxisValue::Continuous(dx),
+                        );
                     }
 
-                    // Send axis_stop when both values are zero (scroll end)
+                    // Both stop axes need the same source within this frame.
                     if dy.abs() <= f64::EPSILON && dx.abs() <= f64::EPSILON {
-                        pointer.axis_stop(time_ms(time_usec), Axis::VerticalScroll);
-                        pointer.axis_stop(time_ms(time_usec), Axis::HorizontalScroll);
+                        send_scroll_axis(
+                            pointer,
+                            Axis::VerticalScroll,
+                            time_ms(time_usec),
+                            ScrollAxisValue::Stop,
+                        );
+                        send_scroll_axis(
+                            pointer,
+                            Axis::HorizontalScroll,
+                            time_ms(time_usec),
+                            ScrollAxisValue::Stop,
+                        );
                     }
 
                     pointer.frame();
@@ -616,16 +687,16 @@ impl InputBackend for WlrInputBackend {
             }) => {
                 if let Some(ref pointer) = ctx.pointer {
                     use wayland_client::protocol::wl_pointer::Axis;
-
-                    // Discrete scroll uses wheel axis source
-                    pointer.axis_source(wayland_client::protocol::wl_pointer::AxisSource::Wheel);
-
                     let wl_axis = match axis {
                         ScrollAxis::Vertical => Axis::VerticalScroll,
                         ScrollAxis::Horizontal => Axis::HorizontalScroll,
                     };
-                    let value = (steps as f64) * 15.0;
-                    pointer.axis_discrete(time_ms(time_usec), wl_axis, value, steps);
+                    send_scroll_axis(
+                        pointer,
+                        wl_axis,
+                        time_ms(time_usec),
+                        ScrollAxisValue::Discrete(steps),
+                    );
                     pointer.frame();
                 }
             }
@@ -633,8 +704,18 @@ impl InputBackend for WlrInputBackend {
             InputEvent::Pointer(PointerEvent::ScrollStop { time_usec }) => {
                 if let Some(ref pointer) = ctx.pointer {
                     use wayland_client::protocol::wl_pointer::Axis;
-                    pointer.axis_stop(time_ms(time_usec), Axis::VerticalScroll);
-                    pointer.axis_stop(time_ms(time_usec), Axis::HorizontalScroll);
+                    send_scroll_axis(
+                        pointer,
+                        Axis::VerticalScroll,
+                        time_ms(time_usec),
+                        ScrollAxisValue::Stop,
+                    );
+                    send_scroll_axis(
+                        pointer,
+                        Axis::HorizontalScroll,
+                        time_ms(time_usec),
+                        ScrollAxisValue::Stop,
+                    );
                     pointer.frame();
                 }
             }
@@ -833,6 +914,79 @@ impl Dispatch<WlSeat, ()> for WlrState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_frames_keep_a_single_source_for_both_axes() {
+        use wayland_client::protocol::wl_pointer::{Axis, AxisSource};
+
+        // Model wlroots 0.18's per-axis buffers. axis_source updates only the
+        // most recently selected axis, and frame delivery resets both sources
+        // to Wheel (zero). The seat rejects mixed sources within one frame.
+        for initial_axis in [Axis::VerticalScroll, Axis::HorizontalScroll] {
+            for (values, expected_source) in [
+                (
+                    vec![(Axis::VerticalScroll, ScrollAxisValue::Continuous(15.0))],
+                    AxisSource::Continuous,
+                ),
+                (
+                    vec![(Axis::HorizontalScroll, ScrollAxisValue::Continuous(-15.0))],
+                    AxisSource::Continuous,
+                ),
+                (
+                    vec![
+                        (Axis::VerticalScroll, ScrollAxisValue::Continuous(15.0)),
+                        (Axis::HorizontalScroll, ScrollAxisValue::Continuous(-15.0)),
+                    ],
+                    AxisSource::Continuous,
+                ),
+                (
+                    vec![
+                        (Axis::VerticalScroll, ScrollAxisValue::Stop),
+                        (Axis::HorizontalScroll, ScrollAxisValue::Stop),
+                    ],
+                    AxisSource::Continuous,
+                ),
+                (
+                    vec![(Axis::VerticalScroll, ScrollAxisValue::Discrete(1))],
+                    AxisSource::Wheel,
+                ),
+                (
+                    vec![(Axis::HorizontalScroll, ScrollAxisValue::Discrete(-1))],
+                    AxisSource::Wheel,
+                ),
+                (
+                    vec![
+                        (Axis::VerticalScroll, ScrollAxisValue::Discrete(1)),
+                        (Axis::HorizontalScroll, ScrollAxisValue::Discrete(-1)),
+                    ],
+                    AxisSource::Wheel,
+                ),
+            ] {
+                let mut selected = initial_axis as usize;
+                let mut sources = [AxisSource::Wheel; 2];
+                let mut valid = [false; 2];
+                for (axis, value) in values {
+                    for request in scroll_axis_requests(axis, 37, value) {
+                        match request {
+                            ScrollRequest::Axis { axis, time, .. } => {
+                                assert_eq!(time, 37);
+                                selected = axis as usize;
+                                valid[selected] = true;
+                            }
+                            ScrollRequest::Source(source) => sources[selected] = source,
+                        }
+                    }
+                }
+                let delivered: Vec<_> = valid
+                    .into_iter()
+                    .zip(sources)
+                    .filter_map(|(valid, source)| valid.then_some(source))
+                    .collect();
+                assert!(!delivered.is_empty());
+                assert!(delivered.iter().all(|source| *source == expected_source));
+            }
+        }
+    }
 
     #[test]
     fn virtual_keyboard_keymap_is_nul_terminated_once() {

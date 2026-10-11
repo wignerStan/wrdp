@@ -14,3 +14,4 @@
 | [0010](0010-use-one-server-lifecycle.md) | Use one RDP listener and connection lifecycle | accepted |
 | [0011](0011-own-session-audio.md) | Own audio in the managed desktop session | accepted |
 | [0012](0012-match-h264-driver-and-wire-headers.md) | Match H.264 packed driver headers, negotiated codec, and exclusive region bounds | accepted |
+| [0013](0013-enforce-hardware-fallback-policy.md) | Enforce the hardware fallback flag and negotiated codec on graphics recovery | accepted |

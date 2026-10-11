@@ -79,6 +79,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, RdpSpecificCode};
 use ironrdp_server::{
     BitmapUpdate as IronBitmapUpdate, DesktopSize, DisplayUpdate, GfxServerHandle,
     PixelFormat as IronPixelFormat, RdpServerDisplay, RdpServerDisplayUpdates, ServerEvent,
@@ -564,6 +565,43 @@ fn hardware_runtime_fallback_reason(
         Some(0) => Some("hardware encoder produced empty H.264 payload"),
         Some(_) => None,
     }
+}
+
+/// Recover only into the codec already negotiated with the client. A strict
+/// hardware policy ends this connection; it must not silently change backends.
+fn recover_hardware_failure<T, E: std::fmt::Display>(
+    allow_software: bool,
+    negotiated_mode: Option<NegotiatedEgfxMode>,
+    create_software: impl FnOnce() -> std::result::Result<T, E>,
+    event_sender: Option<&mpsc::UnboundedSender<ServerEvent>>,
+    client_active: &AtomicBool,
+    reason: &str,
+) -> Option<T> {
+    if allow_software && negotiated_mode == Some(NegotiatedEgfxMode::Avc420) {
+        match create_software() {
+            Ok(encoder) => {
+                warn!(reason, "hardware encoding failed; using OpenH264 AVC420");
+                return Some(encoder);
+            }
+            Err(error) => {
+                error!(%error, "software AVC420 recovery failed");
+            }
+        }
+    }
+
+    client_active.store(false, Ordering::SeqCst);
+    error!(
+        reason,
+        allow_software, "hardware encoding failed; disconnecting client"
+    );
+    if let Some(sender) = event_sender
+        && let Err(error) = sender.send(ServerEvent::Disconnect(ErrorInfo::RdpSpecificCode(
+            RdpSpecificCode::GraphicsSubsystemFailed,
+        )))
+    {
+        debug!(%error, "graphics failure disconnect receiver is closed");
+    }
+    None
 }
 
 impl VideoEncoder {
@@ -1206,6 +1244,27 @@ impl DisplayChannelHandler {
     pub fn is_client_active(&self) -> bool {
         self.client_active.load(std::sync::atomic::Ordering::SeqCst)
     }
+    async fn recover_hardware_encoder(
+        &self,
+        config: Option<EncoderConfig>,
+        reason: &str,
+    ) -> Option<Avc420Encoder> {
+        let mode = self.negotiated_egfx_mode().await;
+        let sender = self.server_event_tx.read().await.clone();
+        recover_hardware_failure(
+            self.config.hardware_encoding.fallback_to_software,
+            mode,
+            || {
+                let config =
+                    config.ok_or_else(|| anyhow::anyhow!("missing H.264 recovery config"))?;
+                Avc420Encoder::new(config).map_err(anyhow::Error::from)
+            },
+            sender.as_ref(),
+            &self.client_active,
+            reason,
+        )
+    }
+
     /// Set graphics queue sender for priority multiplexing
     ///
     /// When set, frames will be routed through the graphics queue instead of
@@ -1897,6 +1956,10 @@ impl DisplayChannelHandler {
                             frames_sent = 0;
                             frames_dropped = 0;
                             egfx_frames_sent = 0;
+                            #[cfg(feature = "vaapi")]
+                            {
+                                hardware_encoding_runtime_disabled = false;
+                            }
                             video_encoder = None;
                             egfx_sender = None;
                             // Clear cached frame from the earlier session. The cached frame
@@ -2327,10 +2390,21 @@ impl DisplayChannelHandler {
                                         );
                                     }
                                     Err(e) => {
-                                        warn!(
-                                            "Hardware encoder failed: {:?} - falling back to OpenH264",
-                                            e
-                                        );
+                                        hardware_encoding_runtime_disabled = true;
+                                        let recovery = handler
+                                            .recover_hardware_encoder(
+                                                h264_encoder_config.clone(),
+                                                &format!(
+                                                    "hardware encoder initialization failed: {e}"
+                                                ),
+                                            )
+                                            .await;
+                                        if let Some(encoder) = recovery {
+                                            video_encoder = Some(VideoEncoder::Avc420(encoder));
+                                        } else {
+                                            frames_dropped += 1;
+                                            continue;
+                                        }
                                     }
                                 }
                             }
@@ -2681,27 +2755,19 @@ impl DisplayChannelHandler {
                                 if let Some(reason) =
                                     hardware_runtime_fallback_reason(codec_name, Some(payload_len))
                                 {
-                                    warn!(
-                                        "{} from {}; disabling hardware encoding for this session and falling back to OpenH264 AVC420",
-                                        reason, codec_name
-                                    );
                                     #[cfg(feature = "vaapi")]
                                     {
                                         hardware_encoding_runtime_disabled = true;
                                     }
-                                    if let Some(config) = h264_encoder_config.clone() {
-                                        match Avc420Encoder::new(config) {
-                                            Ok(sw_encoder) => {
-                                                *encoder = VideoEncoder::Avc420(sw_encoder);
-                                                force_first_frame = true;
-                                            }
-                                            Err(e) => {
-                                                error!(
-                                                    "Failed to create OpenH264 fallback encoder after hardware runtime failure: {:?}",
-                                                    e
-                                                );
-                                            }
-                                        }
+                                    if let Some(recovery) = handler
+                                        .recover_hardware_encoder(
+                                            h264_encoder_config.clone(),
+                                            reason,
+                                        )
+                                        .await
+                                    {
+                                        *encoder = VideoEncoder::Avc420(recovery);
+                                        force_first_frame = true;
                                     }
                                     frames_dropped += 1;
                                     continue;
@@ -2783,27 +2849,19 @@ impl DisplayChannelHandler {
                             }
                             Err(e) => {
                                 if encoder.is_hardware() {
-                                    warn!(
-                                        "Hardware H.264 encoding failed: {:?}; disabling hardware encoding for this session and falling back to OpenH264 AVC420",
-                                        e
-                                    );
                                     #[cfg(feature = "vaapi")]
                                     {
                                         hardware_encoding_runtime_disabled = true;
                                     }
-                                    if let Some(config) = h264_encoder_config.clone() {
-                                        match Avc420Encoder::new(config) {
-                                            Ok(sw_encoder) => {
-                                                *encoder = VideoEncoder::Avc420(sw_encoder);
-                                                force_first_frame = true;
-                                            }
-                                            Err(err) => {
-                                                error!(
-                                                    "Failed to create OpenH264 fallback encoder after hardware encode error: {:?}",
-                                                    err
-                                                );
-                                            }
-                                        }
+                                    if let Some(recovery) = handler
+                                        .recover_hardware_encoder(
+                                            h264_encoder_config.clone(),
+                                            &format!("hardware encode failed: {e}"),
+                                        )
+                                        .await
+                                    {
+                                        *encoder = VideoEncoder::Avc420(recovery);
+                                        force_first_frame = true;
                                     }
                                 } else {
                                     // CRITICAL: Once EGFX is active, don't fall back to RemoteFX
@@ -3589,6 +3647,73 @@ mod tests {
             hardware_runtime_fallback_reason("VA-API H.264", Some(128)),
             None
         );
+    }
+
+    #[test]
+    fn hardware_failure_policy_controls_factory_and_disconnect() {
+        for reason in ["initialization failed", "empty payload", "encode failed"] {
+            for allow_software in [false, true] {
+                for mode in [
+                    None,
+                    Some(NegotiatedEgfxMode::Avc420),
+                    Some(NegotiatedEgfxMode::Avc444),
+                    Some(NegotiatedEgfxMode::Bitmap),
+                ] {
+                    let calls = std::cell::Cell::new(0u32);
+                    let active = AtomicBool::new(true);
+                    let (sender, mut receiver) = mpsc::unbounded_channel();
+                    let recovered = recover_hardware_failure(
+                        allow_software,
+                        mode,
+                        || {
+                            calls.set(calls.get() + 1);
+                            Ok::<_, &str>(42)
+                        },
+                        Some(&sender),
+                        &active,
+                        reason,
+                    );
+                    let should_recover = allow_software && mode == Some(NegotiatedEgfxMode::Avc420);
+                    assert_eq!(calls.get(), u32::from(should_recover));
+                    assert_eq!(recovered, should_recover.then_some(42));
+                    assert_eq!(active.load(Ordering::SeqCst), should_recover);
+                    if should_recover {
+                        assert!(receiver.try_recv().is_err());
+                    } else {
+                        assert!(matches!(
+                            receiver.try_recv(),
+                            Ok(ServerEvent::Disconnect(ErrorInfo::RdpSpecificCode(
+                                RdpSpecificCode::GraphicsSubsystemFailed
+                            )))
+                        ));
+                        assert!(receiver.try_recv().is_err());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn software_recovery_failure_disconnects_only_client() {
+        let active = AtomicBool::new(true);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let recovered = recover_hardware_failure(
+            true,
+            Some(NegotiatedEgfxMode::Avc420),
+            || Err::<(), _>("decoder library unavailable"),
+            Some(&sender),
+            &active,
+            "encode failed",
+        );
+        assert!(recovered.is_none());
+        assert!(!active.load(Ordering::SeqCst));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ServerEvent::Disconnect(ErrorInfo::RdpSpecificCode(
+                RdpSpecificCode::GraphicsSubsystemFailed
+            )))
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]

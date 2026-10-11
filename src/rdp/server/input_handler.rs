@@ -7,6 +7,7 @@
 //! pointer workarounds and CJK clipboard-paste fallback are kept here because
 //! both are driven by incoming client input events.
 
+use std::collections::HashSet;
 use std::sync::{
     Arc, RwLock as StdRwLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -69,6 +70,38 @@ impl CjkPasteBuffer {
         } else {
             Some(std::mem::take(&mut self.buf))
         }
+    }
+}
+
+const KEY_LEFTSHIFT: u32 = 42;
+const KEY_RIGHTSHIFT: u32 = 54;
+
+/// Shift ownership for physical scancodes and shifted ASCII Unicode input.
+///
+/// Unicode input must not release a Shift key still held by the client. Keep
+/// one injected left Shift state even when physical and Unicode owners overlap.
+#[derive(Default)]
+struct UnicodeShiftState {
+    shifted_keys: HashSet<u16>,
+    left_shift_pressed: bool,
+}
+
+impl UnicodeShiftState {
+    async fn synchronize(
+        &mut self,
+        session_handle: &Arc<dyn crate::rdp::session::SessionHandle>,
+        keyboard: &KeyboardHandler,
+    ) -> Result<(), InputError> {
+        let pressed = keyboard.is_key_pressed(KEY_LEFTSHIFT)
+            || (!keyboard.is_key_pressed(KEY_RIGHTSHIFT) && !self.shifted_keys.is_empty());
+        if pressed != self.left_shift_pressed {
+            session_handle
+                .notify_keyboard_keycode(KEY_LEFTSHIFT as i32, pressed)
+                .await
+                .map_err(portal_err)?;
+            self.left_shift_pressed = pressed;
+        }
+        Ok(())
     }
 }
 
@@ -507,6 +540,7 @@ impl InputChannelHandler {
 
         tokio::spawn(async move {
             let mut cjk_buffer = CjkPasteBuffer::new();
+            let mut unicode_shift = UnicodeShiftState::default();
             let consecutive_mouse_errors = AtomicU64::new(0);
             let consecutive_kbd_errors = AtomicU64::new(0);
 
@@ -524,6 +558,7 @@ impl InputChannelHandler {
                                     &keyboard_clone,
                                     event,
                                     &mut cjk_buffer,
+                                    &mut unicode_shift,
                                     cjk_enabled_task,
                                     clipboard_provider_task.as_ref(),
                                 ).await.map_err(|error| ("keyboard", error))
@@ -735,6 +770,7 @@ impl InputChannelHandler {
         keyboard_handler: &Arc<Mutex<KeyboardHandler>>,
         event: IronKeyboardEvent,
         cjk_buffer: &mut CjkPasteBuffer,
+        unicode_shift: &mut UnicodeShiftState,
         cjk_paste_enabled: bool,
         clipboard_provider: Option<&Arc<dyn ClipboardProvider>>,
     ) -> Result<(), InputError> {
@@ -773,10 +809,13 @@ impl InputChannelHandler {
                     }
                 };
 
-                session_handle
-                    .notify_keyboard_keycode(keycode as i32, true)
-                    .await
-                    .map_err(portal_err)?;
+                if keycode != KEY_LEFTSHIFT {
+                    session_handle
+                        .notify_keyboard_keycode(keycode as i32, true)
+                        .await
+                        .map_err(portal_err)?;
+                }
+                unicode_shift.synchronize(session_handle, &keyboard).await?;
             }
 
             IronKeyboardEvent::Released { code, extended } => {
@@ -792,20 +831,22 @@ impl InputChannelHandler {
                     }
                 };
 
-                session_handle
-                    .notify_keyboard_keycode(keycode as i32, false)
-                    .await
-                    .map_err(portal_err)?;
+                // Acquire any Unicode-owned left Shift before releasing right
+                // Shift, so the effective modifier never drops between owners.
+                unicode_shift.synchronize(session_handle, &keyboard).await?;
+                if keycode != KEY_LEFTSHIFT {
+                    session_handle
+                        .notify_keyboard_keycode(keycode as i32, false)
+                        .await
+                        .map_err(portal_err)?;
+                }
             }
 
             IronKeyboardEvent::UnicodePressed(unicode) => {
                 if let Some((keycode, needs_shift)) = unicode_to_evdev(unicode) {
-                    // KEY_LEFTSHIFT = 42
                     if needs_shift {
-                        session_handle
-                            .notify_keyboard_keycode(42, true)
-                            .await
-                            .map_err(portal_err)?;
+                        unicode_shift.shifted_keys.insert(unicode);
+                        unicode_shift.synchronize(session_handle, &keyboard).await?;
                     }
                     session_handle
                         .notify_keyboard_keycode(keycode as i32, true)
@@ -849,10 +890,8 @@ impl InputChannelHandler {
                             .await
                             .map_err(portal_err)?;
                         if needs_shift {
-                            session_handle
-                                .notify_keyboard_keycode(42, false)
-                                .await
-                                .map_err(portal_err)?;
+                            unicode_shift.shifted_keys.remove(&unicode);
+                            unicode_shift.synchronize(session_handle, &keyboard).await?;
                         }
                     }
                 } else if let Some(keysym) = unicode_to_keysym(unicode) {
@@ -1337,6 +1376,223 @@ impl Clone for InputChannelHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingKeyboardSession {
+        keys: std::sync::Mutex<Vec<(i32, bool)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::rdp::session::SessionHandle for RecordingKeyboardSession {
+        fn direct_frame_receiver(
+            &self,
+        ) -> anyhow::Result<crate::rdp::session::backend::DirectFrameReceiver> {
+            anyhow::bail!("keyboard fixture does not capture frames")
+        }
+
+        fn streams(&self) -> Vec<StreamInfo> {
+            Vec::new()
+        }
+
+        async fn notify_keyboard_keycode(&self, keycode: i32, pressed: bool) -> anyhow::Result<()> {
+            self.keys
+                .lock()
+                .expect("keyboard fixture lock")
+                .push((keycode, pressed));
+            Ok(())
+        }
+
+        async fn notify_pointer_motion_absolute(
+            &self,
+            _stream_id: u32,
+            _x: f64,
+            _y: f64,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("keyboard fixture does not inject pointers")
+        }
+
+        async fn notify_pointer_button(&self, _button: i32, _pressed: bool) -> anyhow::Result<()> {
+            anyhow::bail!("keyboard fixture does not inject pointers")
+        }
+
+        async fn notify_pointer_axis(&self, _dx: f64, _dy: f64) -> anyhow::Result<()> {
+            anyhow::bail!("keyboard fixture does not inject pointers")
+        }
+
+        fn clipboard_source(&self) -> crate::rdp::session::backend::ClipboardSource {
+            crate::rdp::session::backend::ClipboardSource::None
+        }
+    }
+
+    fn scancode(code: u8, pressed: bool) -> IronKeyboardEvent {
+        if pressed {
+            IronKeyboardEvent::Pressed {
+                code,
+                extended: false,
+            }
+        } else {
+            IronKeyboardEvent::Released {
+                code,
+                extended: false,
+            }
+        }
+    }
+
+    async fn injected_keyboard_events(events: Vec<IronKeyboardEvent>) -> Vec<(i32, bool)> {
+        let recorded = Arc::new(RecordingKeyboardSession::default());
+        let session: Arc<dyn crate::rdp::session::SessionHandle> = recorded.clone();
+        let keyboard = Arc::new(Mutex::new(KeyboardHandler::new()));
+        let mut cjk = CjkPasteBuffer::new();
+        let mut unicode_shift = UnicodeShiftState::default();
+        for event in events {
+            InputChannelHandler::handle_keyboard_event_impl(
+                &session,
+                &keyboard,
+                event,
+                &mut cjk,
+                &mut unicode_shift,
+                false,
+                None,
+            )
+            .await
+            .expect("keyboard injection");
+        }
+        recorded.keys.lock().expect("keyboard fixture lock").clone()
+    }
+
+    #[tokio::test]
+    async fn unicode_release_preserves_physical_left_shift() {
+        let keys = injected_keyboard_events(vec![
+            scancode(0x2a, true),
+            IronKeyboardEvent::UnicodePressed(0x41),
+            IronKeyboardEvent::UnicodeReleased(0x41),
+            IronKeyboardEvent::Pressed {
+                code: 0x4b,
+                extended: true,
+            },
+            IronKeyboardEvent::Released {
+                code: 0x4b,
+                extended: true,
+            },
+            scancode(0x2a, false),
+        ])
+        .await;
+        assert_eq!(
+            keys,
+            [
+                (42, true),
+                (30, true),
+                (30, false),
+                (105, true),
+                (105, false),
+                (42, false)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unicode_input_uses_held_right_shift_without_synthesizing_left() {
+        let keys = injected_keyboard_events(vec![
+            scancode(0x36, true),
+            IronKeyboardEvent::UnicodePressed(0x21),
+            IronKeyboardEvent::UnicodeReleased(0x21),
+            scancode(0x36, false),
+        ])
+        .await;
+        assert_eq!(keys, [(54, true), (2, true), (2, false), (54, false)]);
+    }
+
+    #[tokio::test]
+    async fn unicode_release_preserves_both_physical_shifts() {
+        let keys = injected_keyboard_events(vec![
+            scancode(0x2a, true),
+            scancode(0x36, true),
+            IronKeyboardEvent::UnicodePressed(0x41),
+            IronKeyboardEvent::UnicodeReleased(0x41),
+            scancode(0x2a, false),
+            scancode(0x36, false),
+        ])
+        .await;
+        assert_eq!(
+            keys,
+            [
+                (42, true),
+                (54, true),
+                (30, true),
+                (30, false),
+                (42, false),
+                (54, false)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_unicode_keys_release_shift_after_the_last_owner() {
+        let keys = injected_keyboard_events(vec![
+            IronKeyboardEvent::UnicodePressed(0x41),
+            IronKeyboardEvent::UnicodePressed(0x21),
+            IronKeyboardEvent::UnicodeReleased(0x41),
+            IronKeyboardEvent::UnicodeReleased(0x21),
+        ])
+        .await;
+        assert_eq!(
+            keys,
+            [
+                (42, true),
+                (30, true),
+                (2, true),
+                (30, false),
+                (2, false),
+                (42, false)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn physical_left_shift_takes_over_a_unicode_press_without_duplicate_down() {
+        let keys = injected_keyboard_events(vec![
+            IronKeyboardEvent::UnicodePressed(0x41),
+            scancode(0x2a, true),
+            IronKeyboardEvent::UnicodeReleased(0x41),
+            scancode(0x2a, false),
+        ])
+        .await;
+        assert_eq!(keys, [(42, true), (30, true), (30, false), (42, false)]);
+    }
+
+    #[tokio::test]
+    async fn unicode_keeps_shift_when_physical_left_is_released_first() {
+        let keys = injected_keyboard_events(vec![
+            scancode(0x2a, true),
+            IronKeyboardEvent::UnicodePressed(0x41),
+            scancode(0x2a, false),
+            IronKeyboardEvent::UnicodeReleased(0x41),
+        ])
+        .await;
+        assert_eq!(keys, [(42, true), (30, true), (30, false), (42, false)]);
+    }
+
+    #[tokio::test]
+    async fn unicode_acquires_left_shift_before_physical_right_is_released() {
+        let keys = injected_keyboard_events(vec![
+            scancode(0x36, true),
+            IronKeyboardEvent::UnicodePressed(0x41),
+            scancode(0x36, false),
+            IronKeyboardEvent::UnicodeReleased(0x41),
+        ])
+        .await;
+        assert_eq!(
+            keys,
+            [
+                (54, true),
+                (30, true),
+                (42, true),
+                (54, false),
+                (30, false),
+                (42, false)
+            ]
+        );
+    }
 
     #[test]
     fn unicode_to_keysym_maps_bmp_cjk_to_xkb_unicode_keysym() {
